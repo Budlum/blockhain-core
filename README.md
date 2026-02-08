@@ -32,9 +32,9 @@ graph TD
     
     subgraph "Core Blockchain Logic"
         Node --> Chain[Blockchain Manager]
-        Chain --> State[Account State (Balances/Nonces)]
+        Chain --> State["Account State (Balances/Nonces)"]
         Chain --> Mempool[Pending Transactions]
-        Chain --> Store[Storage (Sled DB)]
+        Chain --> Store["Storage (Sled DB)"]
     end
 
     subgraph "Consensus Layer (Pluggable)"
@@ -46,8 +46,8 @@ graph TD
 
     subgraph "Networking Layer (libp2p)"
         Node --> Swarm[P2P Swarm]
-        Swarm --> Gossip[GossipSub (Block/TX Propagation)]
-        Swarm --> Disc[Discovery (Kademlia/mDNS)]
+        Swarm --> Gossip["GossipSub (Block/TX Propagation)"]
+        Swarm --> Disc["Discovery (Kademlia/mDNS)"]
         Swarm --> PeerMgr[Peer Score & Ban Manager]
     end
 ```
