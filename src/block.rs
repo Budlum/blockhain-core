@@ -4,8 +4,80 @@ use crate::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CHAIN_ID: u64 = 1337;
-
 use crate::consensus::pos::SlashingEvidence;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlockHeader {
+    pub index: u64,
+    pub timestamp: u128,
+    pub previous_hash: String,
+    pub hash: String,
+    pub producer: Option<String>,
+    pub chain_id: u64,
+    pub state_root: String,
+    pub tx_root: String,
+    pub slashing_evidence: Option<Vec<SlashingEvidence>>,
+    pub nonce: u64,
+}
+
+impl BlockHeader {
+    pub fn from_block(block: &Block) -> Self {
+        BlockHeader {
+            index: block.index,
+            timestamp: block.timestamp,
+            previous_hash: block.previous_hash.clone(),
+            hash: block.hash.clone(),
+            producer: block.producer.clone(),
+            chain_id: block.chain_id,
+            state_root: block.state_root.clone(),
+            tx_root: block.tx_root.clone(),
+            slashing_evidence: block.slashing_evidence.clone(),
+            nonce: block.nonce,
+        }
+    }
+
+    pub fn calculate_hash(&self) -> String {
+        let producer_bytes = self
+            .producer
+            .as_ref()
+            .map(|p| p.as_bytes().to_vec())
+            .unwrap_or_default();
+        let evidence_bytes = self
+            .slashing_evidence
+            .as_ref()
+            .map(|e| serde_json::to_vec(e).unwrap_or_default())
+            .unwrap_or_default();
+
+        hash_fields(&[
+            b"BDLM_BLOCK_V2",
+            &self.index.to_le_bytes(),
+            &self.timestamp.to_le_bytes(),
+            self.previous_hash.as_bytes(),
+            self.tx_root.as_bytes(),
+            &self.nonce.to_le_bytes(),
+            &producer_bytes,
+            &evidence_bytes,
+            &self.chain_id.to_le_bytes(),
+            self.state_root.as_bytes(),
+        ])
+    }
+
+    pub fn verify_signature(&self, signature: &[u8]) -> bool {
+        let producer_hex = match &self.producer {
+            Some(p) => p,
+            None => return false,
+        };
+        let public_key = match hex::decode(producer_hex) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+        let calculated_hash = self.calculate_hash();
+        if calculated_hash != self.hash {
+            return false;
+        }
+        verify_signature(self.hash.as_bytes(), signature, &public_key).is_ok()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Block {
@@ -20,11 +92,15 @@ pub struct Block {
     pub stake_proof: Option<Vec<u8>>,
     pub chain_id: u64,
     pub slashing_evidence: Option<Vec<SlashingEvidence>>,
+    pub state_root: String,
+    pub tx_root: String,
 }
+
 impl Block {
     pub fn new(index: u64, previous_hash: String, transactions: Vec<Transaction>) -> Self {
         Self::new_with_chain_id(index, previous_hash, transactions, DEFAULT_CHAIN_ID)
     }
+
     pub fn new_with_chain_id(
         index: u64,
         previous_hash: String,
@@ -35,6 +111,7 @@ impl Block {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
+
         let mut block = Block {
             index,
             timestamp,
@@ -47,19 +124,42 @@ impl Block {
             stake_proof: None,
             chain_id,
             slashing_evidence: None,
+            state_root: String::new(),
+            tx_root: String::new(),
         };
+        block.tx_root = block.calculate_tx_root();
         block.hash = block.calculate_hash();
         block
     }
     pub fn genesis() -> Self {
         Block::new(0, "0".repeat(64), vec![Transaction::genesis()])
     }
+
+    pub fn calculate_tx_root(&self) -> String {
+        let mut tx_hashes: Vec<String> =
+            self.transactions.iter().map(|tx| tx.hash.clone()).collect();
+
+        if tx_hashes.is_empty() {
+            return "0".repeat(64);
+        }
+
+        while tx_hashes.len() > 1 {
+            let mut next_level = Vec::new();
+            for chunk in tx_hashes.chunks(2) {
+                let left = &chunk[0];
+                let right = if chunk.len() > 1 { &chunk[1] } else { left };
+                let combined = format!("{}{}", left, right);
+                next_level.push(hex::encode(crate::hash::calculate_hash(
+                    combined.as_bytes(),
+                )));
+            }
+            tx_hashes = next_level;
+        }
+
+        tx_hashes[0].clone()
+    }
+
     pub fn calculate_hash(&self) -> String {
-        let tx_data: Vec<u8> = self
-            .transactions
-            .iter()
-            .flat_map(|tx| tx.to_bytes())
-            .collect();
         let producer_bytes = self
             .producer
             .as_ref()
@@ -72,15 +172,16 @@ impl Block {
             .unwrap_or_default();
 
         hash_fields(&[
-            b"BDLM_BLOCK_V1",
+            b"BDLM_BLOCK_V2",
             &self.index.to_le_bytes(),
             &self.timestamp.to_le_bytes(),
             self.previous_hash.as_bytes(),
-            &tx_data,
+            self.tx_root.as_bytes(),
             &self.nonce.to_le_bytes(),
             &producer_bytes,
             &evidence_bytes,
             &self.chain_id.to_le_bytes(),
+            self.state_root.as_bytes(),
         ])
     }
     pub fn sign(&mut self, keypair: &KeyPair) {

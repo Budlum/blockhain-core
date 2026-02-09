@@ -4,7 +4,10 @@ mod blockchain;
 mod cli;
 mod consensus;
 mod crypto;
+mod encoding;
+mod genesis;
 mod hash;
+mod mempool;
 mod network;
 mod snapshot;
 mod storage;
@@ -12,7 +15,7 @@ mod transaction;
 
 #[cfg(test)]
 mod integration_tests;
-use block::Block;
+use block::{Block, BlockHeader};
 use blockchain::Blockchain;
 use clap::Parser;
 use cli::{ConsensusType, NodeConfig};
@@ -44,17 +47,15 @@ async fn main() {
         }
         ConsensusType::PoS => {
             println!("🥩 PoS mode - min stake: {}", config.min_stake);
-            Arc::new(PoSEngine::new(config.min_stake, None))
+            let pos_config = crate::consensus::pos::PoSConfig {
+                 min_stake: config.min_stake,
+                 ..Default::default()
+            };
+            Arc::new(PoSEngine::new(pos_config, None))
         }
         ConsensusType::PoA => {
             println!("👥 PoA mode");
-            let validators = config.load_validators();
-            if validators.is_empty() {
-                println!("⚠️  No validators configured. Create validators.json with:");
-                println!("    {{ \"validators\": [\"addr1\", \"addr2\"] }}");
-            }
-
-            Arc::new(PoAEngine::new(validators, None))
+            Arc::new(PoAEngine::new(crate::consensus::poa::PoAConfig::default(), None))
         }
     };
     let storage = match storage::Storage::new(&config.db_path) {
@@ -73,6 +74,22 @@ async fn main() {
         config.chain_id,
         Some(pruning_manager),
     )));
+    
+    if let ConsensusType::PoA = config.consensus {
+         let validators = config.load_validators();
+         if !validators.is_empty() {
+             println!("👥 Initializing PoA validators: {:?}", validators);
+             let mut bc = blockchain.lock().unwrap();
+             for addr in validators {
+                 let mut v = crate::account::Validator::new(addr.clone(), 0);
+                 v.active = true;
+                 bc.state.validators.insert(addr, v);
+             }
+         } else {
+             println!("⚠️  No validators configured!");
+         }
+    }
+
     let mut node = Node::new(blockchain.clone()).unwrap();
     if let Some(ref addr) = config.bootstrap {
         if let Err(e) = node.bootstrap(addr) {
@@ -119,7 +136,11 @@ async fn main() {
                             client.list_peers().await;
                         }
                         "sync" => {
-                            client.broadcast("blocks".to_string(), NetworkMessage::GetBlocks).await;
+                            let msg = NetworkMessage::GetHeaders {
+                                locator: Vec::new(),
+                                limit: 2000,
+                            };
+                            client.broadcast("blocks".to_string(), msg).await;
                         }
                         "help" => {
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -133,6 +154,8 @@ async fn main() {
                         }
                         _ => {}
                     }
+
+
                 }
             }
         } => {}

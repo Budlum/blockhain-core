@@ -1,5 +1,6 @@
+use crate::consensus::pos::SlashingEvidence;
 use crate::storage::Storage;
-use crate::Transaction;
+use crate::transaction::{Transaction, TransactionType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub const MIN_TX_FEE: u64 = 1;
@@ -26,22 +27,70 @@ impl Account {
         }
     }
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Validator {
+    pub address: String,
+    pub stake: u64,
+    pub active: bool,
+    pub slashed: bool,
+    pub jailed: bool,
+    pub jail_until: u64,
+    pub last_proposed_block: Option<u64>,
+    pub votes_for: u64,     
+    pub votes_against: u64, 
+}
+
+impl Validator {
+    pub fn new(address: String, stake: u64) -> Self {
+        Validator {
+            address,
+            stake,
+            active: true,
+            slashed: false,
+            jailed: false,
+            jail_until: 0,
+            last_proposed_block: None,
+            votes_for: 0,
+            votes_against: 0,
+        }
+    }
+    pub fn effective_stake(&self) -> u64 {
+        if self.slashed || self.jailed {
+            0
+        } else {
+            self.stake
+        }
+    }
+    pub fn is_eligible(&self, current_block: u64) -> bool {
+        self.active && !self.slashed && (!self.jailed || current_block >= self.jail_until)
+    }
+}
+
 #[derive(Clone)]
 pub struct AccountState {
-    accounts: HashMap<String, Account>,
+    pub accounts: HashMap<String, Account>,
+    pub validators: HashMap<String, Validator>, 
     storage: Option<Storage>,
+    pub epoch_index: u64,
+    pub last_epoch_time: u64,
 }
 impl AccountState {
     pub fn new() -> Self {
         AccountState {
             accounts: HashMap::new(),
+            validators: HashMap::new(),
             storage: None,
+            epoch_index: 0,
+            last_epoch_time: 0,
         }
     }
     pub fn with_storage(storage: Storage) -> Self {
         let mut state = AccountState {
             accounts: HashMap::new(),
+            validators: HashMap::new(),
             storage: Some(storage),
+            epoch_index: 0,
+            last_epoch_time: 0,
         };
         if let Err(e) = state.load_from_storage() {
             println!("Could not load account state: {}", e);
@@ -53,6 +102,33 @@ impl AccountState {
         self.accounts.insert(genesis_pubkey.to_string(), account);
         println!("Genesis account created: {} coins", GENESIS_BALANCE);
     }
+    pub fn add_validator(&mut self, address: String, stake: u64) {
+        let validator = Validator::new(address.clone(), stake);
+        self.validators.insert(address, validator);
+    }
+    pub fn get_total_stake(&self) -> u64 {
+        self.validators
+            .values()
+            .filter(|v| v.active && !v.slashed)
+            .map(|v| v.stake)
+            .sum()
+    }
+    pub fn get_active_validators(&self) -> Vec<&Validator> {
+        let mut validators: Vec<&Validator> = self
+            .validators
+            .values()
+            .filter(|v| v.active && !v.slashed)
+            .collect();
+        validators.sort_by(|a, b| a.address.cmp(&b.address));
+        validators
+    }
+    pub fn get_validator(&self, address: &str) -> Option<&Validator> {
+        self.validators.get(address)
+    }
+    pub fn get_validator_mut(&mut self, address: &str) -> Option<&mut Validator> {
+        self.validators.get_mut(address)
+    }
+
     pub fn get_balance(&self, public_key: &str) -> u64 {
         self.accounts
             .get(public_key)
@@ -94,25 +170,171 @@ impl AccountState {
                 balance, total_cost, tx.amount, tx.fee
             ));
         }
+
+        match tx.tx_type {
+            TransactionType::Transfer => {
+                if tx.to.is_empty() {
+                    return Err("Transfer missing 'to' address".into());
+                }
+            }
+            TransactionType::Stake => {
+                if tx.amount == 0 {
+                    return Err("Stake amount must be > 0".into());
+                }
+            }
+            TransactionType::Unstake => {
+                if let Some(validator) = self.validators.get(&tx.from) {
+                    if validator.stake < tx.amount {
+                        return Err(format!(
+                            "Insufficient stake: {} < {}",
+                            validator.stake, tx.amount
+                        ));
+                    }
+                } else {
+                    return Err("Not a validator".into());
+                }
+            }
+            TransactionType::Vote => {
+                if !self.validators.contains_key(&tx.from) {
+                    return Err("Only validators can vote".into());
+                }
+            }
+        }
+
         Ok(())
     }
+
+    pub fn apply_slashing(&mut self, evidences: &[SlashingEvidence], slash_ratio: f64) {
+        for evidence in evidences {
+            if let Some(producer) = &evidence.header1.producer {
+                if let Some(validator) = self.validators.get_mut(producer) {
+                    if !validator.slashed {
+                        let penalty = (validator.stake as f64 * slash_ratio) as u64;
+                        validator.stake = validator.stake.saturating_sub(penalty);
+                        validator.slashed = true;
+                        validator.active = false;
+                        let jail_duration = 3600 * 24; 
+                                                       
+                                                       
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        validator.jail_until = now + jail_duration;
+                        println!("🔪 Slashed validator {} for {} stake", producer, penalty);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn advance_epoch(&mut self, current_timestamp: u128) {
+        self.epoch_index += 1;
+        self.last_epoch_time = current_timestamp as u64;
+        println!("🔄 Epoch advanced to {}", self.epoch_index);
+
+        
+        
+        
+        let current_time_sec = (current_timestamp / 1000) as u64;
+
+        for (addr, validator) in self.validators.iter_mut() {
+            if validator.jailed && validator.jail_until <= current_time_sec {
+                println!("🔓 Validator {} released from jail", addr);
+                validator.jailed = false;
+                if validator.stake > 0 {
+                    validator.active = true;
+                }
+            }
+        }
+    }
+
     pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), String> {
         if tx.from == "genesis" {
             return Ok(());
         }
-        let total_cost = tx.total_cost();
+
+        
+        
+        
+        
+
+        let total_cost = tx.total_cost(); 
+
+        
         {
-            let from_account = self.get_or_create(&tx.from);
-            if from_account.balance < total_cost {
+            let sender_account = self.get_or_create(&tx.from);
+            if sender_account.balance < total_cost {
                 return Err("Insufficient balance".into());
             }
-            from_account.balance -= total_cost;
-            from_account.nonce += 1;
         }
-        {
-            let to_account = self.get_or_create(&tx.to);
-            to_account.balance += tx.amount;
+
+        
+        match tx.tx_type {
+            TransactionType::Transfer => {
+                let sender = self.get_or_create(&tx.from);
+                sender.balance -= total_cost;
+                sender.nonce += 1;
+
+                let receiver = self.get_or_create(&tx.to);
+                receiver.balance += tx.amount;
+            }
+            TransactionType::Stake => {
+                let sender = self.get_or_create(&tx.from);
+                sender.balance -= total_cost;
+                sender.nonce += 1;
+
+                let stake_amount = tx.amount;
+                let validator = self
+                    .validators
+                    .entry(tx.from.clone())
+                    .or_insert_with(|| Validator::new(tx.from.clone(), 0));
+                validator.stake += stake_amount;
+                validator.active = true;
+                println!("Stake added: {} now has {}", tx.from, validator.stake);
+            }
+            TransactionType::Unstake => {
+                
+                
+                
+                
+                
+                
+
+                
+                let sender_start_balance = self.get_balance(&tx.from);
+                if sender_start_balance < tx.fee {
+                    return Err("Insufficient balance for fee".into());
+                }
+
+                if let Some(validator) = self.validators.get_mut(&tx.from) {
+                    if validator.stake < tx.amount {
+                        return Err("Insufficient stake".into());
+                    }
+                    validator.stake -= tx.amount;
+                    if validator.stake == 0 {
+                        validator.active = false; 
+                    }
+                    println!("Unstake: {} now has {}", tx.from, validator.stake);
+                } else {
+                    return Err("Not a validator".into());
+                }
+
+                let sender = self.get_or_create(&tx.from);
+                sender.balance -= tx.fee; 
+                sender.balance += tx.amount; 
+                sender.nonce += 1;
+            }
+            TransactionType::Vote => {
+                let sender = self.get_or_create(&tx.from);
+                sender.balance -= tx.fee;
+                sender.nonce += 1;
+
+                
+                println!("Vote TX processed from {}", tx.from);
+            }
         }
+
         Ok(())
     }
     pub fn apply_block(&mut self, transactions: &[Transaction], block_producer: Option<&str>) {
@@ -199,6 +421,24 @@ impl AccountState {
             .iter()
             .map(|(k, v)| (k.clone(), v.nonce))
             .collect()
+    }
+
+    pub fn calculate_state_root(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut sorted_accounts: Vec<_> = self.accounts.iter().collect();
+        sorted_accounts.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"BDLM_STATE_V1");
+
+        for (pubkey, account) in sorted_accounts {
+            hasher.update(pubkey.as_bytes());
+            hasher.update(account.balance.to_le_bytes());
+            hasher.update(account.nonce.to_le_bytes());
+        }
+
+        hex::encode(hasher.finalize())
     }
 }
 impl Default for AccountState {

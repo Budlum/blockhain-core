@@ -1,5 +1,7 @@
 use crate::account::AccountState;
 use crate::consensus::ConsensusEngine;
+use crate::genesis::{GenesisConfig, GENESIS_TIMESTAMP};
+use crate::mempool::{Mempool, MempoolConfig};
 use crate::snapshot::PruningManager;
 use crate::storage::Storage;
 use crate::{Block, Transaction};
@@ -7,11 +9,12 @@ use std::sync::Arc;
 
 pub const MAX_REORG_DEPTH: usize = 100;
 pub const FINALITY_DEPTH: usize = 50;
+pub const EPOCH_LENGTH: u64 = 32;
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
     pub consensus: Arc<dyn ConsensusEngine>,
-    pub pending_transactions: Vec<Transaction>,
+    pub mempool: Mempool,
     pub storage: Option<Storage>,
     pub state: AccountState,
     pub chain_id: u64,
@@ -40,9 +43,7 @@ impl Blockchain {
         }
 
         if !loaded_chain {
-            let mut genesis = Block::genesis();
-            genesis.chain_id = chain_id;
-            genesis.hash = genesis.calculate_hash();
+            let genesis = GenesisConfig::new(chain_id).build_genesis_block();
             chain_vec.push(genesis);
         }
 
@@ -111,7 +112,7 @@ impl Blockchain {
         Blockchain {
             chain: chain_vec,
             consensus,
-            pending_transactions: Vec::new(),
+            mempool: Mempool::new(MempoolConfig::default()),
             storage,
             state,
             chain_id,
@@ -160,7 +161,8 @@ impl Blockchain {
         let mut valid_txs = Vec::new();
         let mut temp_state = self.state.clone();
 
-        for tx in &self.pending_transactions {
+        let pending_txs = self.mempool.get_sorted_transactions(1000);
+        for tx in &pending_txs {
             if let Ok(_) = temp_state.validate_transaction(tx) {
                 if let Ok(_) = temp_state.apply_transaction(tx) {
                     valid_txs.push(tx.clone());
@@ -180,7 +182,7 @@ impl Blockchain {
 
         block.producer = Some(producer_address.clone());
 
-        if let Err(e) = self.consensus.prepare_block(&mut block) {
+        if let Err(e) = self.consensus.prepare_block(&mut block, &self.state) {
             println!("Block preparation failed: {}", e);
             return;
         }
@@ -195,8 +197,15 @@ impl Blockchain {
             let _ = self.state.apply_transaction(tx);
         }
 
-        self.chain.push(block);
-        self.pending_transactions = Vec::new();
+        if block.index > 0 && block.index % EPOCH_LENGTH == 0 {
+            self.state.advance_epoch(block.timestamp);
+        }
+
+        self.chain.push(block.clone());
+
+        for tx in &block.transactions {
+            self.mempool.remove_transaction(&tx.hash);
+        }
     }
     pub fn mine_pending_transactions(&mut self, miner_address: String) {
         self.produce_block(miner_address);
@@ -211,8 +220,10 @@ impl Blockchain {
         if let Err(e) = self.state.validate_transaction(&transaction) {
             return Err(format!("Invalid transaction: {}", e));
         }
-        self.pending_transactions.push(transaction);
-        Ok(())
+
+        self.mempool
+            .add_transaction(transaction)
+            .map_err(|e| format!("Mempool error: {:?}", e))
     }
 
     pub fn init_genesis_account(&mut self, address: &str) {
@@ -227,7 +238,10 @@ impl Blockchain {
             ));
         }
 
-        if let Err(e) = self.consensus.validate_block(&block, &self.chain) {
+        if let Err(e) = self
+            .consensus
+            .validate_block(&block, &self.chain, &self.state)
+        {
             return Err(format!("Consensus validation failed: {}", e));
         }
 
@@ -238,22 +252,41 @@ impl Blockchain {
             }
         }
 
+        if !block.state_root.is_empty() {
+            let computed_root = temp_state.calculate_state_root();
+            if computed_root != block.state_root {
+                return Err(format!(
+                    "State root mismatch: expected {}, got {}",
+                    block.state_root, computed_root
+                ));
+            }
+        }
+
         if let Some(ref store) = self.storage {
             let _ = store.insert_block(&block);
             let _ = store.save_last_hash(&block.hash);
+        }
+
+        if let Some(evidences) = &block.slashing_evidence {
+            let slash_ratio = 0.1;
+            temp_state.apply_slashing(evidences, slash_ratio);
+        }
+
+        if block.index > 0 && block.index % EPOCH_LENGTH == 0 {
+            temp_state.advance_epoch(block.timestamp);
         }
 
         self.state = temp_state;
 
         self.chain.push(block);
 
-        let mut new_pending = Vec::new();
-        for tx in &self.pending_transactions {
-            if self.state.validate_transaction(tx).is_ok() {
-                new_pending.push(tx.clone());
-            }
+        if let Err(e) = self.consensus.record_block(self.chain.last().unwrap()) {
+            println!("Engine record block error: {}", e);
         }
-        self.pending_transactions = new_pending;
+
+        for tx in self.chain.last().unwrap().transactions.iter() {
+            self.mempool.remove_transaction(&tx.hash);
+        }
 
         Ok(())
     }
@@ -262,7 +295,11 @@ impl Blockchain {
         for i in 0..self.chain.len() {
             let block = &self.chain[i];
             let previous_chain = &self.chain[..i];
-            if let Err(e) = self.consensus.validate_block(block, previous_chain) {
+            let dummy_state = AccountState::new();
+            if let Err(e) = self
+                .consensus
+                .validate_block(block, previous_chain, &dummy_state)
+            {
                 println!("Block {} validation failed: {}", i, e);
                 return false;
             }
@@ -273,13 +310,25 @@ impl Blockchain {
         if chain.is_empty() {
             return false;
         }
-        if chain[0] != Block::genesis() {
+
+        let genesis = &chain[0];
+        if genesis.index != 0
+            || genesis.previous_hash != "0".repeat(64)
+            || genesis.timestamp != GENESIS_TIMESTAMP
+            || genesis.hash != genesis.calculate_hash()
+            || genesis.chain_id != self.chain_id
+        {
             return false;
         }
+
         for i in 0..chain.len() {
             let block = &chain[i];
             let previous_chain = &chain[..i];
-            if let Err(_) = self.consensus.validate_block(block, previous_chain) {
+            let dummy_state = AccountState::new();
+            if let Err(_) = self
+                .consensus
+                .validate_block(block, previous_chain, &dummy_state)
+            {
                 return false;
             }
         }
@@ -297,7 +346,7 @@ impl Blockchain {
         None
     }
     pub fn try_reorg(&mut self, new_chain: Vec<Block>) -> Result<bool, String> {
-        if new_chain.len() <= self.chain.len() {
+        if !self.consensus.is_better_chain(&self.chain, &new_chain) {
             return Ok(false);
         }
         if !self.is_valid_chain(&new_chain) {
@@ -338,14 +387,18 @@ impl Blockchain {
             }
         }
 
-        for tx in &self.pending_transactions {
+        for tx in &self.mempool.get_sorted_transactions(1000) {
             if !chain_txs.contains(&tx.hash) {
                 if self.state.validate_transaction(tx).is_ok() {
                     new_pending.push(tx.clone());
                 }
             }
         }
-        self.pending_transactions = new_pending;
+
+        self.mempool = Mempool::new(MempoolConfig::default());
+        for tx in new_pending {
+            let _ = self.mempool.add_transaction(tx);
+        }
 
         if let Some(ref store) = self.storage {
             if let Some(last) = self.chain.last() {
@@ -396,7 +449,7 @@ impl Blockchain {
         println!("================================");
         println!("Consensus: {}", self.consensus.info());
         println!("Length: {}", self.chain.len());
-        println!("Pending Tx: {}", self.pending_transactions.len());
+        println!("Pending Tx: {}", self.mempool.len());
         println!("================================");
         for block in &self.chain {
             println!(" Block #{}: {}", block.index, &block.hash[..16]);
@@ -411,7 +464,7 @@ impl Clone for Blockchain {
         Blockchain {
             chain: self.chain.clone(),
             consensus: Arc::clone(&self.consensus),
-            pending_transactions: self.pending_transactions.clone(),
+            mempool: Mempool::default(),
             storage: self.storage.clone(),
             state: self.state.clone(),
             chain_id: self.chain_id,
@@ -444,5 +497,134 @@ mod tests {
         blockchain.produce_block("miner1".to_string());
         assert!(blockchain.is_valid());
         assert_eq!(blockchain.chain.len(), 2);
+    }
+
+    #[test]
+    fn test_epoch_transition_and_unjailing() {
+        let consensus = Arc::new(PoWEngine::new(1));
+        let mut blockchain = Blockchain::new(consensus, None, 1337, None);
+
+        
+        let validator_addr = "validator1".to_string();
+        blockchain.state.add_validator(validator_addr.clone(), 1000);
+
+        
+        if let Some(v) = blockchain.state.get_validator_mut(&validator_addr) {
+            v.jailed = true;
+            v.active = false;
+            v.jail_until = 0; 
+        }
+
+        
+        assert_eq!(blockchain.state.epoch_index, 0);
+        if let Some(v) = blockchain.state.get_validator(&validator_addr) {
+            assert!(v.jailed);
+        }
+
+        
+        
+        
+        for _ in 0..EPOCH_LENGTH {
+            blockchain.produce_block("miner".to_string());
+        }
+
+        
+        assert_eq!(blockchain.chain.len(), (EPOCH_LENGTH as usize) + 1);
+
+        
+        assert_eq!(blockchain.state.epoch_index, 1);
+
+        
+        if let Some(v) = blockchain.state.get_validator(&validator_addr) {
+            assert!(!v.jailed, "Validator should have been unjailed");
+            assert!(v.active, "Validator should be active");
+        } else {
+            panic!("Validator not found");
+        }
+    }
+
+    #[test]
+    fn test_slashing_execution() {
+        use crate::block::BlockHeader;
+        use crate::consensus::pos::{PoSConfig, SlashingEvidence};
+        use crate::consensus::PoSEngine;
+
+        
+        let alice_key = KeyPair::generate().unwrap();
+        let alice_pub = alice_key.public_key_hex();
+
+        
+        let mut config = PoSConfig::default();
+        config.slashing_penalty = 0.50; 
+
+        let engine = Arc::new(PoSEngine::new(config, Some(alice_key.clone()))); 
+
+        let mut blockchain = Blockchain::new(engine.clone(), None, 1337, None);
+
+        
+        blockchain.state.add_validator(alice_pub.clone(), 2000);
+        blockchain.state.add_balance(&alice_pub, 100);
+
+        
+        let mut real_b1 = Block::new(10, "prev".into(), vec![]);
+        real_b1.producer = Some(alice_pub.clone());
+        real_b1.hash = real_b1.calculate_hash();
+        let sig1 = alice_key.sign(real_b1.hash.as_bytes()).to_vec();
+        real_b1.signature = Some(sig1.clone());
+        let h1 = BlockHeader::from_block(&real_b1);
+
+        let mut real_b2 = Block::new(10, "prev".into(), vec![]);
+        real_b2.timestamp += 1; 
+        real_b2.producer = Some(alice_pub.clone());
+        real_b2.hash = real_b2.calculate_hash();
+        let sig2 = alice_key.sign(real_b2.hash.as_bytes()).to_vec();
+        real_b2.signature = Some(sig2.clone());
+        let h2 = BlockHeader::from_block(&real_b2);
+
+        let evidence = SlashingEvidence::new(h1, h2, sig1, sig2);
+
+        
+        {
+            let mut guard = engine.slashing_evidence.write().unwrap();
+            guard.push(evidence);
+        }
+
+        
+        
+        blockchain.produce_block(alice_pub.clone());
+
+        let produced_block = blockchain.chain.last().unwrap();
+        assert!(
+            produced_block.slashing_evidence.is_some(),
+            "Block should contain slashing evidence"
+        );
+        assert_eq!(produced_block.slashing_evidence.as_ref().unwrap().len(), 1);
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+
+        
+        
+
+        let mut blockchain2 = Blockchain::new(engine.clone(), None, 1337, None);
+        blockchain2.state.add_validator(alice_pub.clone(), 2000);
+        blockchain2
+            .validate_and_add_block(produced_block.clone())
+            .unwrap();
+
+        let validator = blockchain2.state.get_validator(&alice_pub).unwrap();
+        assert!(validator.slashed, "Validator should be slashed");
+        assert!(!validator.active);
+        assert!(validator.stake < 2000);
     }
 }

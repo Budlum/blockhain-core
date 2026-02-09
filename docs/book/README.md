@@ -1,0 +1,57 @@
+# Budlum Blok Zinciri Kitabı
+
+Hoş geldiniz!
+
+Bu kitap, **Budlum Blockchain** projesinin yaşayan teknik dokümantasyonudur. Ancak sıradan bir API referansı değildir. Bu kitap, **bir blok zinciri mimarının zihnine açılan bir kapıdır.**
+
+Amacımız, sadece "Bu kod ne işe yarar?" sorusuna değil, **"Bu kodu neden böyle tasarladık?", "Hangi probleme çözüm ürettik?"** ve **"Alternatifleri nelerdi?"** sorularına cevap vermektir.
+
+Kod tabanımız **Rust** ile yazılmıştır ve modern teknolojileri kullanır:
+-   **Kriptografi:** Ed25519 (Eliptik Eğri İmzaları)
+-   **Ağ:** Libp2p (Gossipsub, Kademlia DHT)
+-   **Veritabanı:** Sled (Gömülü Key-Value Store)
+-   **Konsensüs:** Pluggable (Tak-Çıkar) PoW ve PoS Motorları
+
+---
+
+## Nasıl Okunmalı?
+
+Kitap, "Mimarın Gözünden" (From the Architect's Eye) yaklaşımıyla 5 ana bölüme ayrılmıştır. Sırayla okumanızı tavsiye ederiz.
+
+### 1. [Bölüm 1: Temeller ve Veri Yapıları](ch01_basics.md)
+Blok zincirinin atomik parçaları.
+-   [Bloklar](ch01_01_blocks.md): **Merkle Ağaçları** neden var? **SPV** (Light Client) nasıl çalışır?
+-   [İşlemler](ch01_02_transactions.md): **Replay Attack** nedir? **Nonce** bunu nasıl engeller?
+-   [Hesap Durumu](ch01_03_account_state.md): **State Machine** mantığı ve **UTXO vs Account** model karşılaştırması.
+
+### 2. [Bölüm 2: Kriptografi](ch02_crypto.md)
+Güvenliğin matematiksel temeli.
+-   [İmzalar](ch02_01_signatures.md): Neden **Ed25519**? Deterministik imza nedir?
+-   [Hash Ağaçları](ch02_02_merkle_trees.md): Veri bütünlüğü nasıl **O(log N)** maliyetle kanıtlanır?
+
+### 3. [Bölüm 3: Konsensüs](ch03_consensus.md)
+Merkeziyetsiz karar verme mekanizmaları.
+-   [Motor Arayüzü](ch03_01_intro.md): **Modüler Mimari** ve `ConsensusEngine` Trait'i.
+-   [Proof of Work](ch03_02_pow.md): Satoshi'nin vizyonu. **Zorluk Ayarlama Algoritması** (Difficulty Adjustment) analizi.
+-   [Proof of Stake](ch03_03_pos.md): Modern çözüm. **Nothing at Stake** problemi, **Slashing** (Ceza) ve **Lider Seçimi**.
+
+### 4. [Bölüm 4: Ağ ve P2P](ch04_networking.md)
+Bilgisayarların ortak dili.
+-   [Node Mimarisi](ch04_01_node.md): **Tokio Event Loop** ve Asenkron programlama.
+-   [Peer Manager](ch04_02_peer_manager.md): **Oyun Teorisi** ile itibar yönetimi ve **Sybil Saldırısı** koruması.
+-   [Protokol](ch04_03_protocol.md): **Bincode** serileştirme ve Ağ limitleri.
+
+### 5. [Bölüm 5: Depolama ve Verim](ch05_storage.md)
+Verinin kalıcılığı.
+-   [Veritabanı](ch05_01_storage.md): **LSM Tree** (Sled) ve Key-Value şeması.
+-   [Mempool](ch05_02_mempool.md): **Ücret Piyasası** (Fee Market) ve işlem önceliklendirme.
+-   [Snapshot](ch05_03_snapshots.md): **Pruning** (Budama) ve **Hızlı Senkronizasyon** (State Sync).
+
+---
+
+## Katkıda Bulunun
+
+Budlum açık kaynaklı bir projedir. Kodları `infra/src` altında bulabilir, bu kitaptaki teorileri pratikle birleştirebilirsiniz. Bir hata görürseniz veya daha iyi bir açıklamanız varsa, lütfen katkıda bulunun!
+
+İyi okumalar,
+*Budlum Çekirdek Ekibi*

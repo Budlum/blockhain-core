@@ -1,4 +1,4 @@
-mod poa;
+pub mod poa;
 pub mod pos;
 mod pow;
 use crate::Block;
@@ -21,9 +21,19 @@ pub const MIN_BLOCK_INTERVAL_MS: u128 = 1000;
 pub const MAX_BLOCK_SIZE: usize = 1_000_000;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 5000;
 pub const MAX_REORG_DEPTH: usize = 100;
+use crate::account::AccountState;
+
 pub trait ConsensusEngine: Send + Sync {
-    fn prepare_block(&self, block: &mut Block) -> Result<(), ConsensusError>;
-    fn validate_block(&self, block: &Block, chain: &[Block]) -> Result<(), ConsensusError>;
+    fn prepare_block(&self, block: &mut Block, state: &AccountState) -> Result<(), ConsensusError>;
+    fn validate_block(
+        &self,
+        block: &Block,
+        chain: &[Block],
+        state: &AccountState,
+    ) -> Result<(), ConsensusError>;
+    fn record_block(&self, _block: &Block) -> Result<(), ConsensusError> {
+        Ok(())
+    }
     fn consensus_type(&self) -> &'static str;
     fn info(&self) -> String;
     fn validate_timestamp(
@@ -105,15 +115,28 @@ pub trait ConsensusEngine: Send + Sync {
         }
         true
     }
-    fn full_validate(&self, block: &Block, chain: &[Block]) -> Result<(), ConsensusError> {
+    fn full_validate(
+        &self,
+        block: &Block,
+        chain: &[Block],
+        state: &AccountState,
+    ) -> Result<(), ConsensusError> {
         if block.index == 0 {
-            return self.validate_block(block, chain);
+            return self.validate_block(block, chain, state);
         }
         let prev_block = chain.last();
         self.validate_timestamp(block, prev_block)?;
         self.validate_block_size(block)?;
-        self.validate_block(block, chain)?;
+        self.validate_block(block, chain, state)?;
         Ok(())
+    }
+
+    fn fork_choice_score(&self, chain: &[Block]) -> u128 {
+        chain.len() as u128
+    }
+
+    fn is_better_chain(&self, current: &[Block], candidate: &[Block]) -> bool {
+        self.fork_choice_score(candidate) > self.fork_choice_score(current)
     }
 }
 #[cfg(test)]

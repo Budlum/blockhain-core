@@ -57,13 +57,16 @@ graph TD
 | Module | Source File | Description |
 | :--- | :--- | :--- |
 | **Blockchain** | `src/blockchain.rs` | Orchestrates the chain, validation, and reorg logic. |
-| **Block** | `src/block.rs` | `Block` struct, hashing, and signing logic. |
+| **Block** | `src/block.rs` | `Block` struct, hashing, `BlockHeader` and `state_root`. |
 | **Transaction** | `src/transaction.rs` | `Transaction` struct, signature verification, and replay protection. |
 | **Account** | `src/account.rs` | State transition logic (balance transfers, nonce increments). |
 | **Network** | `src/network/` | P2P stack, protocol messages, and peer reputation. |
 | **Consensus** | `src/consensus/` | Implementations of PoW, PoS, and PoA algorithms. |
 | **Storage** | `src/storage.rs` | Persistent storage interface using `sled`. |
 | **Snapshot** | `src/snapshot.rs` | State snapshotting and pruning for fast sync. |
+| **Mempool** | `src/mempool.rs` | Transaction pool with fee sorting, RBF, and anti-spam. |
+| **Genesis** | `src/genesis.rs` | Genesis block configuration and economic parameters. |
+| **Encoding** | `src/encoding.rs` | Deterministic encoding and protocol versioning. |
 
 ---
 
@@ -146,18 +149,101 @@ Budlum abstracts consensus into the `ConsensusEngine` trait.
 #### Proof of Authority (PoA) (`src/consensus/poa.rs`)
 - **Permissioned**: Only keys in `validators.json` can sign.
 - **Round-Robin**: Validators produce blocks in a strict rotation (`height % validator_count`).
+- **Suspension**: Authorities can be suspended for a period (`suspend_authority()`).
 
 ---
 
-### 3. Networking Layer
+### 3. Mempool & Anti-Spam (`src/mempool.rs`)
+
+A structured transaction pool with advanced spam protection.
+
+#### Features
+- **Fee-Based Ordering**: Transactions sorted by fee (highest first).
+- **Replace-By-Fee (RBF)**: Higher-fee tx replaces same-nonce tx (+10% bump required).
+- **Anti-Spam Rules**:
+  - Max 16 pending transactions per sender.
+  - Minimum fee enforcement.
+  - Duplicate rejection.
+- **TTL Expiration**: Stale transactions auto-removed.
+
+#### Configuration
+```rust
+MempoolConfig {
+    max_size: 5000,
+    max_per_sender: 16,
+    min_fee: 1,
+    tx_ttl_secs: 3600,
+    rbf_bump_percent: 10,
+}
+```
+
+---
+
+### 4. Genesis & Monetary Policy (`src/genesis.rs`)
+
+Deterministic genesis block and economic parameters.
+
+#### GenesisConfig
+```rust
+GenesisConfig {
+    chain_id: 1337,
+    allocations: vec![("address", amount)],  // Initial balances
+    validators: vec!["pubkey1", "pubkey2"],  // Initial validators
+    block_reward: 50,
+    base_fee: 1,
+}
+```
+
+#### Economic Constants
+- `BLOCK_REWARD`: 50 BDLM per block
+- `BASE_FEE`: 1 BDLM minimum transaction fee
+- `GENESIS_TIMESTAMP`: Fixed for deterministic hash
+
+---
+
+### 5. Protocol Versioning (`src/encoding.rs`)
+
+Deterministic encoding and protocol compatibility.
+
+#### Version Info
+- **Protocol Version**: `1.0.0`
+- **Network Magic**: `0xBD4C4D01` ("BDLM" + version)
+
+#### Handshake Protocol
+New peer connections exchange version info:
+```rust
+NetworkMessage::Handshake {
+    version_major: 1,
+    version_minor: 0,
+    chain_id: 1337,
+    best_height: 12345,
+}
+```
+
+#### Deterministic Encoding
+- `encode_transaction()` - Binary tx encoding
+- `encode_block_header()` - Binary header encoding
+- Version compatibility checking
+
+---
+
+### 6. Networking Layer
 
 Budlum uses the **libp2p** stack to ensure robust, decentralized peer-to-peer communication.
 
+#### Sync Protocol
+Headers-first synchronization for efficient chain sync:
+- `GetHeaders` / `Headers`: Lightweight header sync
+- `GetBlocksRange` / `Blocks`: Chunked block download
+- `NewTip`: Tip gossip for new block announcements
+- `GetStateSnapshot` / `SnapshotChunk`: State snapshot sync
+
 #### Protocol Messages
 Defined in `src/network/protocol.rs`:
-- `NewBlock(Block)`: Broadcasts a new block to neighbors.
-- `NewTransaction(Transaction)`: Broadcasts a pending transaction.
-- `RequestChain` / `Chain(Vec<Block>)`: Used for Initial Block Download (IBD).
+- `Handshake` / `HandshakeAck`: Protocol version exchange.
+- `Block(Block)`: Broadcasts a new block to neighbors.
+- `Transaction(Transaction)`: Broadcasts a pending transaction.
+- `RequestChain` / `Chain(Vec<Block>)`: Full chain sync (legacy).
 
 #### DoS Protection: Peer Scoring
 To prevent spam and attacks, the `PeerManager` (`src/network/peer_manager.rs`) assigns scores:
@@ -192,8 +278,9 @@ Data is persisted in **sled**, a high-performance embedded database.
 
 #### Domain Separation
 We prefix all hashes to prevent context confusion attacks.
-- Block Hash Prefix: `BDLM_BLOCK_V1`
+- Block Hash Prefix: `BDLM_BLOCK_V2` (includes state_root)
 - TX Hash Prefix: `BDLM_TX_V1`
+- State Root Prefix: `BDLM_STATE_V1`
 
 #### Chain ID
 Every transaction is signed with a specific `chain_id`.
@@ -224,7 +311,7 @@ Usage: `cargo run -- [OPTIONS]`
 ## 🛠️ Development Guide
 
 ### Running Tests
-Budlum has extensive unit and integration tests (69+ tests).
+Budlum has extensive unit and integration tests (83+ tests).
 ```bash
 cargo test
 ```

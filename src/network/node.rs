@@ -206,12 +206,16 @@ impl Node {
                             let chain = self.blockchain.lock().unwrap();
                             info!("DEBUG: Connected to {}, Chain length: {}", peer_id, chain.chain.len());
                             if chain.chain.len() == 1 {
+                                let locator = vec![chain.chain.last().unwrap().hash.clone()];
                                 drop(chain);
-                                info!("🔌 New connection, requesting blocks...");
+                                info!("🔌 New connection, requesting headers...");
                                 let topic = gossipsub::IdentTopic::new("blocks");
-                                let msg = NetworkMessage::GetBlocks;
+                                let msg = NetworkMessage::GetHeaders {
+                                    locator,
+                                    limit: 2000,
+                                };
                                 if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, msg.to_bytes()) {
-                                    warn!("Failed to request blocks: {}", e);
+                                    warn!("Failed to request headers: {}", e);
                                 }
                             }
                         }
@@ -293,32 +297,125 @@ impl Node {
                                             }
                                         }
                                     }
-                                    NetworkMessage::GetBlocks => {
-                                        info!("📥 Received GetBlocks request from {}", peer_id);
+
+
+
+                                    NetworkMessage::GetHeaders { locator, limit } => {
+                                        info!("📥 GetHeaders request from {} (locator: {} hashes, limit: {})",
+                                            peer_id, locator.len(), limit);
                                         let chain = self.blockchain.lock().unwrap();
-                                        let blocks = chain.chain.clone();
-                                        let response = NetworkMessage::Chain(blocks);
+
+
+                                        let start_idx = locator.iter()
+                                            .find_map(|hash| {
+                                                chain.chain.iter().position(|b| &b.hash == hash)
+                                            })
+                                            .map(|i| i + 1)
+                                            .unwrap_or(0);
+
+                                        let end_idx = (start_idx + limit as usize).min(chain.chain.len());
+                                        let headers: Vec<_> = chain.chain[start_idx..end_idx]
+                                            .iter()
+                                            .map(|b| crate::BlockHeader::from_block(b))
+                                            .collect();
+
+                                        info!("📤 Sending {} headers to {}", headers.len(), peer_id);
+                                        let response = NetworkMessage::Headers(headers);
+                                        let topic = gossipsub::IdentTopic::new("blocks");
+                                        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
+                                    }
+
+                                    NetworkMessage::Headers(headers) => {
+                                        if headers.len() > crate::network::protocol::MAX_HEADERS_PER_REQUEST as usize {
+                                            warn!("❌ Received too many headers ({}) from {}", headers.len(), peer_id);
+                                            self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
+                                            continue;
+                                        }
+                                        info!("📨 Received {} headers from {}", headers.len(), peer_id);
+
+                                        self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
+                                    }
+
+                                    NetworkMessage::GetBlocksRange { from, to } => {
+                                        info!("📥 GetBlocksRange request from {} ({}..{})", peer_id, from, to);
+                                        let chain = self.blockchain.lock().unwrap();
+
+                                        let from_idx = from as usize;
+                                        let to_idx = (to as usize).min(chain.chain.len());
+                                        let max_blocks = crate::network::protocol::MAX_CHAIN_SYNC_BLOCKS;
+                                        let to_idx = to_idx.min(from_idx + max_blocks);
+
+                                        if from_idx < chain.chain.len() {
+                                            let blocks: Vec<_> = chain.chain[from_idx..to_idx].to_vec();
+                                            info!("📤 Sending {} blocks to {}", blocks.len(), peer_id);
+                                            let response = NetworkMessage::Blocks(blocks);
+                                            let topic = gossipsub::IdentTopic::new("blocks");
+                                            let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
+                                        }
+                                    }
+
+                                    NetworkMessage::Blocks(blocks) => {
+                                        if blocks.len() > crate::network::protocol::MAX_CHAIN_SYNC_BLOCKS {
+                                            warn!("❌ Received too many blocks ({}) from {}", blocks.len(), peer_id);
+                                            self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
+                                            continue;
+                                        }
+                                        info!("📨 Received {} blocks from {}", blocks.len(), peer_id);
+                                        let mut chain = self.blockchain.lock().unwrap();
+                                        for block in blocks {
+                                            if block.index == chain.chain.len() as u64 {
+                                                match chain.validate_and_add_block(block.clone()) {
+                                                    Ok(_) => info!("✅ Added block #{}", block.index),
+                                                    Err(e) => warn!("❌ Block #{} failed: {}", block.index, e),
+                                                }
+                                            }
+                                        }
+                                        self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
+                                    }
+
+                                    NetworkMessage::NewTip { height, hash } => {
+                                        info!("🔔 NewTip from {}: height={}, hash={}...", peer_id, height, &hash[..8.min(hash.len())]);
+                                        let chain = self.blockchain.lock().unwrap();
+                                        if height > chain.chain.len() as u64 {
+                                            info!("📡 Our chain is behind, requesting sync...");
+
+                                        }
+                                    }
+
+                                    NetworkMessage::GetStateSnapshot { height } => {
+                                        info!("📥 GetStateSnapshot request from {} (height: {})", peer_id, height);
+
+                                    }
+
+                                    NetworkMessage::SnapshotChunk { height, index, total, data } => {
+                                        info!("📨 SnapshotChunk from {}: height={}, {}/{}, {} bytes",
+                                            peer_id, height, index, total, data.len());
+
+                                    }
+
+
+                                    NetworkMessage::Handshake { version_major, version_minor, chain_id, best_height } => {
+                                        info!("🤝 Handshake from {}: v{}.{}, chain={}, height={}",
+                                            peer_id, version_major, version_minor, chain_id, best_height);
+
+                                        let chain = self.blockchain.lock().unwrap();
+                                        let response = NetworkMessage::HandshakeAck {
+                                            version_major: crate::encoding::PROTOCOL_VERSION_MAJOR,
+                                            version_minor: crate::encoding::PROTOCOL_VERSION_MINOR,
+                                            chain_id: chain.chain_id,
+                                            best_height: chain.chain.len() as u64,
+                                        };
                                         let topic = gossipsub::IdentTopic::new("blocks");
                                         let data = response.to_bytes();
                                         if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                                            warn!("Failed to send chain: {}", e);
+                                            warn!("Failed to send HandshakeAck: {}", e);
                                         }
                                     }
-                                    NetworkMessage::Chain(blocks) => {
-                                        info!("⛓️ Received Chain with {} blocks form {}", blocks.len(), peer_id);
 
-                                        let mut chain = self.blockchain.lock().unwrap();
-                                        if blocks.len() > chain.chain.len() {
-                                            if chain.is_valid_chain(&blocks) {
-                                                info!("✅ Replaced local chain with longer chain (len: {})", blocks.len());
-                                                chain.chain = blocks;
-                                                self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
-                                            } else {
-                                                warn!("❌ Received invalid chain!");
-
-                                                self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
-                                            }
-                                        }
+                                    NetworkMessage::HandshakeAck { version_major, version_minor, chain_id, best_height } => {
+                                        info!("🤝 HandshakeAck from {}: v{}.{}, chain={}, height={}",
+                                            peer_id, version_major, version_minor, chain_id, best_height);
+                                        self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
                                     }
                                 },
                                 Err(e) => {

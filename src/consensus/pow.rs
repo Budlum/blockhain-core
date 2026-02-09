@@ -1,4 +1,5 @@
 use super::{ConsensusEngine, ConsensusError};
+use crate::account::AccountState;
 use crate::Block;
 #[derive(Debug, Clone)]
 pub struct PoWConfig {
@@ -74,12 +75,21 @@ impl PoWEngine {
     }
 }
 impl ConsensusEngine for PoWEngine {
-    fn prepare_block(&self, block: &mut Block) -> Result<(), ConsensusError> {
+    fn prepare_block(
+        &self,
+        block: &mut Block,
+        _state: &AccountState,
+    ) -> Result<(), ConsensusError> {
         block.hash = block.calculate_hash();
         self.mine(block);
         Ok(())
     }
-    fn validate_block(&self, block: &Block, chain: &[Block]) -> Result<(), ConsensusError> {
+    fn validate_block(
+        &self,
+        block: &Block,
+        chain: &[Block],
+        _state: &AccountState,
+    ) -> Result<(), ConsensusError> {
         if block.index == 0 {
             if block.hash != block.calculate_hash() {
                 return Err(ConsensusError("Invalid genesis block hash".into()));
@@ -120,6 +130,10 @@ impl ConsensusEngine for PoWEngine {
             self.config.block_reward
         )
     }
+
+    fn fork_choice_score(&self, chain: &[Block]) -> u128 {
+        (chain.len() as u128) * (self.config.difficulty as u128)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -128,18 +142,20 @@ mod tests {
     fn test_pow_mining() {
         let engine = PoWEngine::new(1);
         let mut block = Block::new(1, "0".repeat(64), vec![]);
-        engine.prepare_block(&mut block).unwrap();
+        let state = AccountState::new();
+        engine.prepare_block(&mut block, &state).unwrap();
         assert!(block.hash.starts_with("0"));
     }
     #[test]
     fn test_pow_validation() {
         let engine = PoWEngine::new(1);
         let mut block = Block::new(1, "0".repeat(64), vec![]);
-        engine.prepare_block(&mut block).unwrap();
-        assert!(engine.validate_block(&block, &[]).is_ok());
+        let state = AccountState::new();
+        engine.prepare_block(&mut block, &state).unwrap();
+        assert!(engine.validate_block(&block, &[], &state).is_ok());
         let mut tampered = block.clone();
         tampered.hash = "invalid_hash".to_string();
-        assert!(engine.validate_block(&tampered, &[]).is_err());
+        assert!(engine.validate_block(&tampered, &[], &state).is_err());
     }
     #[test]
     fn test_difficulty_levels() {
@@ -147,8 +163,9 @@ mod tests {
         let hard = PoWEngine::new(2);
         let mut block1 = Block::new(1, "0".repeat(64), vec![]);
         let mut block2 = Block::new(1, "0".repeat(64), vec![]);
-        easy.prepare_block(&mut block1).unwrap();
-        hard.prepare_block(&mut block2).unwrap();
+        let state = AccountState::new();
+        easy.prepare_block(&mut block1, &state).unwrap();
+        hard.prepare_block(&mut block2, &state).unwrap();
         assert!(block1.hash.starts_with("0"));
         assert!(block2.hash.starts_with("00"));
     }

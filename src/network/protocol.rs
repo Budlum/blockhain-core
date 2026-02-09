@@ -1,23 +1,67 @@
-use crate::{Block, Transaction};
+use crate::encoding::PROTOCOL_VERSION_MAJOR;
+use crate::{Block, BlockHeader, Transaction};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 pub const MAX_BLOCK_SIZE: usize = 1 * 1024 * 1024;
 pub const MAX_TX_SIZE: usize = 100 * 1024;
 pub const MAX_CHAIN_SYNC_BLOCKS: usize = 500;
+pub const MAX_HEADERS_PER_REQUEST: u32 = 2000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageError {
     TooLarge(usize),
     ParseError(String),
+    VersionMismatch { expected: u32, got: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
+    Handshake {
+        version_major: u32,
+        version_minor: u32,
+        chain_id: u64,
+        best_height: u64,
+    },
+    HandshakeAck {
+        version_major: u32,
+        version_minor: u32,
+        chain_id: u64,
+        best_height: u64,
+    },
+
     Block(Block),
     Transaction(Transaction),
-    GetBlocks,
-    Chain(Vec<Block>),
+
+    GetHeaders {
+        locator: Vec<String>,
+        limit: u32,
+    },
+
+    Headers(Vec<BlockHeader>),
+
+    GetBlocksRange {
+        from: u64,
+        to: u64,
+    },
+
+    Blocks(Vec<Block>),
+
+    NewTip {
+        height: u64,
+        hash: String,
+    },
+
+    GetStateSnapshot {
+        height: u64,
+    },
+
+    SnapshotChunk {
+        height: u64,
+        index: u32,
+        total: u32,
+        data: Vec<u8>,
+    },
 }
 impl NetworkMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
