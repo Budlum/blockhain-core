@@ -15,6 +15,8 @@ pub enum MessageError {
     VersionMismatch { expected: u32, got: u32 },
 }
 
+pub const MAX_SNAP_BATCH: u64 = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     Handshake {
@@ -46,6 +48,19 @@ pub enum NetworkMessage {
     },
 
     Blocks(Vec<Block>),
+
+    GetBlocksByHeight {
+        from_height: u64,
+        to_height: u64,
+    },
+
+    BlocksByHeight(Vec<Block>),
+
+    StateSnapshotResponse {
+        height: u64,
+        state_root: String,
+        ok: bool,
+    },
 
     NewTip {
         height: u64,

@@ -86,21 +86,21 @@ impl ConsensusEngine for PoAEngine {
                 if keypair.public_key_hex() == expected_signer_addr {
                     block.sign(keypair);
                     println!(
-                        "✍️  PoA: Block {} signed by us ({})",
+                        " PoA: Block {} signed by us ({})",
                         block.index,
                         &expected_signer_addr[..16.min(expected_signer_addr.len())]
                     );
                 } else {
                     /*
                     println!(
-                        "⚠️  PoA: We are not the proposer (us: {}, expected: {})",
+                        " PoA: We are not the proposer (us: {}, expected: {})",
                         keypair.public_key_hex(),
                         expected_signer_addr
                     );
                     */
                 }
             } else {
-                println!("⚠️  PoA: No keypair configured, cannot sign block");
+                println!(" PoA: No keypair configured, cannot sign block");
             }
         }
 
@@ -157,7 +157,7 @@ impl ConsensusEngine for PoAEngine {
             }
 
             println!(
-                "✅ PoA: Block {} signature verified (producer: {})",
+                "PoA: Block {} signature verified (producer: {})",
                 block.index,
                 &producer[..16.min(producer.len())]
             );

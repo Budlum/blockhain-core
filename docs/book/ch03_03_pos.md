@@ -1,6 +1,6 @@
-# Bölüm 3.3: Proof of Stake (PoS) Motoru
+# Bölüm 3.3: Proof of Stake (PoS) Motoru ve RANDAO
 
-Bu bölüm, modern blok zincirlerinin tercihi olan PoS (Hisse Kanıtı) algoritmasını; lider seçim matematiğini, ceza (slashing) sistemini ve konsensüs güvenliğini satır satır inceler.
+Bu bölüm, modern blok zincirlerinin tercihi olan PoS (Hisse Kanıtı) algoritmasını; **RANDAO stili rastlantısal (unbiased) lider seçim matematiğini**, ceza (slashing) sistemini ve konsensüs güvenliğini satır satır inceler.
 
 Kaynak Dosya: `src/consensus/pos.rs`
 
@@ -10,11 +10,8 @@ Kaynak Dosya: `src/consensus/pos.rs`
 
 PoS, parası olanın söz sahibi olduğu, ancak hata yapanın parasını kaybettiği bir ekonomik oyundur.
 
-### Struct: `PoSConfig`
+### Struct: `PoSConfig` ve `PoSEngine`
 
-Sistem parametreleri.
-
-**Kod:**
 ```rust
 pub struct PoSConfig {
     pub min_stake: u64,          // Min. Teminat (örn. 32 ETH)
@@ -22,114 +19,83 @@ pub struct PoSConfig {
     pub epoch_length: u64,       // Bir devir kaç blok sürer? (32 blok)
     pub slashing_penalty: f64,   // Suçun bedeli (Örn. %10)
 }
-```
 
-**Analiz:**
-
-| Alan Adı | Veri Tipi | Neden? | Açıklama |
-| :--- | :--- | :--- | :--- |
-| `min_stake` | `u64` | `u64` | **Giriş Barajı.** Herkesin validatör olmasını engeller. Çok fazla küçük validatör, ağ trafiğini şişirir. Ciddi oyuncuları seçmek için bir eşik vardır. |
-| `slot_duration` | `u64` | `u64` | **Zaman Dilimi.** PoW'da blok süresi rastgeledir (Bulunca biter). PoS'ta ise zaman **Slot**lara bölünmüştür (Tık-tak saat gibi). Her slotta sadece bir kişi blok üretebilir. |
-| `epoch_length` | `u64` | `32` | **Devir.** Belirli periyotlarda yönetimsel işlemler yapılır (Ödül dağıtımı, Validatör setinin değişmesi, Checkpoint alınması). |
-
----
-
-### Struct: `PoSEngine`
-
-**Kod:**
-```rust
 pub struct PoSEngine {
     config: PoSConfig,
     seen_blocks: RwLock<HashMap<(String, u64), String>>, // Çift imza yakalamak için
     slashing_evidence: RwLock<Vec<SlashingEvidence>>,    // Tespit edilen suçlar
+    epoch_seed: RwLock<[u8; 32]>,                        // RANDAO Lider Seçim Tohumu
     keypair: Option<KeyPair>,                            // Eğer biz validatörsek
 }
 ```
 
-**Thread Safety (`RwLock`):**
-PoS motoru aynı anda hem blok üretebilir (Mining Thread) hem de ağdan gelen blokları dinleyebilir (Network Thread). Bu yüzden paylaşılan verilere erişim `RwLock` (Okuma-Yazma Kilidi) ile korunur.
+**Analiz:**
+- **`epoch_seed` (RANDAO Ortak Tohumu):** Ağdaki rastgelelik (randomness) kaynağıdır. `RwLock` ile korunur. Eski tasarımdaki tekil blok bağımlılığını (ve manipülasyonları) çözer.
 
 ---
 
-## 2. Algoritmalar: Seçim ve Ceza
+## 2. Algoritmalar: RANDAO Lider Seçimi ve Ceza
 
 ### Fonksiyon: `select_validator` (Lider Kim?)
 
-Her slot için kimin blok üreteceğini belirleyen "Kura Çekimi" fonksiyonudur.
+Her slot için kimin blok üreteceğini belirleyen "Kura Çekimi" fonksiyonudur. Eski ve manipüle edilebilir yaklaşım (`previous_hash` kullanımı) **Mainnet Hardening** işlemi ile RANDAO stiline güncellendi.
 
 ```rust
-pub fn select_validator(&self, state: &AccountState, previous_hash: &str, slot: u64) -> Option<String> {
-    // 1. Şans Tohumu (Seed) oluştur: Önceki blok hash'i + Slot Numarası.
-    // Bu değer herkes için aynıdır (Deterministik).
-    let seed_input = format!("{}{}", previous_hash, slot);
-    let seed_hash = hash(seed_input); 
-    
-    // 2. Hash'i büyük bir sayıya çevir (u128).
-    let seed_num = u128::from_le_bytes(seed_hash[0..16].try_into().unwrap());
-
-    // 3. Toplam hisseyi (Total Stake) hesapla.
-    let total_stake: u64 = state.validators.values()
-        .filter(|v| v.active)
-        .map(|v| v.stake)
-        .sum();
-
+pub fn select_validator(&self, state: &AccountState, _previous_hash: &str, slot: u64) -> Option<String> {
+    let total_stake = state.get_total_stake();
     if total_stake == 0 { return None; }
 
-    // 4. Kazanan noktayı belirle: `Seed % TotalStake`
-    // Bu, 0 ile TotalStake-1 arasında bir sayıdır.
-    let mut target = (seed_num % total_stake as u128) as u64;
+    // 1. RANDAO Tohumunu Al
+    let seed = self.epoch_seed.read().unwrap();
+    
+    // 2. SHA3(Epoch_Seed || Slot)
+    let mut hasher = Sha3_256::new();
+    hasher.update(*seed);
+    hasher.update(slot.to_le_bytes());
+    let hash = hasher.finalize();
 
-    // 5. Validatörleri gez ve "target" kimin hisse aralığına düşüyor bul.
-    // (Weighted Random Selection)
-    for (address, validator) in &state.validators {
-        if !validator.active { continue; }
-        
-        if target < validator.stake {
-            return Some(address.clone()); // Kazanan sensin!
+    let random_value = u64::from_le_bytes(hash[0..8]...);
+    let selection_point = random_value % total_stake;
+
+    // 3. Kazananı Bul (Weighted Selection)
+    let mut cumulative: u64 = 0;
+    for validator in state.get_active_validators() {
+        cumulative += validator.effective_stake();
+        if selection_point < cumulative {
+            return Some(validator.address.clone());
         }
-        target -= validator.stake;
     }
     None
 }
 ```
 
-**Soru:** Neden `previous_hash` kullanıyoruz?
-**Cevap:** Eğer sadece `slot` numarasına göre seçseydik, liderler 100 yıl boyunca önceden belli olurdu. Saldırganlar "Seneye Salı günü liderim" diyerek o günü bekleyip saldırı yapabilirdi. `previous_hash` (önceki blok), sürekli değişen bir rastgelelik kaynağıdır.
+### Fonksiyon: `record_block` (Seed Toplama & Dedektiflik)
 
----
-
-### Fonksiyon: `record_block` (Dedektiflik)
-
-Ağa gelen her bloğu kaydeder ve "Double Signing" arar.
+Ağa gelen her bloğu kaydeder. İki önemli görevi vardır: **Çift imza yakalamak** ve **RANDAO Tohumunu Güncellemek**.
 
 ```rust
 pub fn record_block(&self, block: &Block) {
-    let producer = block.producer.as_ref().unwrap();
-    let index = block.index;
-    let hash = &block.hash;
+    // 1. RANDAO Tohumu Güncellemesi (XOR-Mix)
+    let block_hash_bytes = hex::decode(&block.hash).unwrap();
+    let mut block_contrib = Sha3_256::new();
+    block_contrib.update(&block_hash_bytes);
+    let contribution: [u8; 32] = block_contrib.finalize().into();
 
-    // Hafıza kilidini al (Yazma modu).
-    let mut seen = self.seen_blocks.write().unwrap();
-    let key = (producer.clone(), index);
-
-    // Eğer bu validatör, bu index (yükseklik) için daha önce blok göndermişse...
-    if let Some(existing_hash) = seen.get(&key) {
-        if existing_hash != hash {
-            // ...ve hash'i farklıysa (Yani içeriği farklı iki blok üretmişse).
-            println!("🚨 SUÇ TESPİT EDİLDİ! Validatör: {}", producer);
-            
-            // Kanıt oluştur ve havuza at.
-            self.slashing_evidence.write().unwrap().push(SlashingEvidence { ... });
+    if let Ok(mut seed) = self.epoch_seed.write() {
+        // Her blok, epoch_seed'i XOR ile mutasyona uğratır.
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte ^= contribution[i];
         }
-    } else {
-        // İlk kez görüyoruz, kaydet.
-        seen.insert(key, hash.clone());
     }
+    
+    // 2. Double-Sign Tespiti
+    // ... Eğer aynı index için farklı hash atanmışsa SlashingEvidence oluştur.
 }
 ```
 
-**Bu Algoritma Neyi Çözer?**
-"Nothing at Stake" problemini çözer. Eğer bir validatör, zincir çatallandığında (fork) "her iki tarafa da oynayayım" derse, bu fonksiyon onu yakalar. İki farklı hash'e sahip aynı indexli blok, suçun tartışılmaz kanıtıdır.
+**Neden RANDAO (XOR-Mix)?**
+Eski yapıda `previous_hash` kullanılıyordu. Bir düğüm çıkaracağı bloğu manipüle edip ufak TX değişiklikleri ile hash'i değiştirerek "sıradaki bloğu da" kendine düşürebilirdi. 
+RANDAO ile, tüm blokların hash'leri ardışık olarak (`XOR` işlemi) birbirine karıştırılır. Epoch bitene kadar hiçkimse tam teşekküllü Epoch Tohumu'nun ne olacağını %100 kestiremez ve oyun oynayamaz (Bias-Resistance).
 
 ---
 
@@ -139,13 +105,12 @@ Eğer sıra bizdeyse çalışır.
 
 ```rust
 fn prepare_block(&self, block: &mut Block, state: &AccountState) {
-    // 1. Önce bekleyen "Suç Kanıtları"nı bloğa ekle.
-    // Adalet gecikmemeli.
+    // 1. Önce bekleyen "Suç Kanıtları"nı bloğa ekle. Adalet gecikmemeli.
     {
         let mut evidence_pool = self.slashing_evidence.write().unwrap();
         if !evidence_pool.is_empty() {
-            block.header.slashing_evidence = Some(evidence_pool.clone());
-            evidence_pool.clear(); // Blok içine aldık, havuzdan sil.
+            block.slashing_evidence = Some(evidence_pool.clone());
+            evidence_pool.clear(); 
         }
     }
 
@@ -164,6 +129,6 @@ Ceza kanıtlarını (`slashing_evidence`) bloğun içine koyuyoruz. Çünkü tü
 ## Özet
 
 `src/consensus/pos.rs`, bir yazılım kodundan ziyade bir "Anayasa" gibidir.
--   **Seçim Kanunu:** `select_validator` ile kimin yöneteceği belirlenir.
+-   **Seçim Kanunu:** `select_validator` ve `epoch_seed` ile RANDAO rastgeleliğinde kimin yöneteceğini belirler.
 -   **Ceza Kanunu:** `record_block` ve `SlashingEvidence` ile kurallara uymayanlar cezalandırılır.
 -   **Yürütme:** `prepare_block` ile kararlar uygulanır (blok üretilir).

@@ -132,7 +132,10 @@ impl Block {
         block
     }
     pub fn genesis() -> Self {
-        Block::new(0, "0".repeat(64), vec![Transaction::genesis()])
+        let mut block = Block::new(0, "0".repeat(64), vec![Transaction::genesis()]);
+        block.timestamp = 0;
+        block.hash = block.calculate_hash();
+        block
     }
 
     pub fn calculate_tx_root(&self) -> String {

@@ -3,6 +3,7 @@ use crate::account::{AccountState, Validator};
 use crate::Block;
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
+use hex;
 
 #[derive(Debug, Clone)]
 pub struct PoSConfig {
@@ -12,6 +13,7 @@ pub struct PoSConfig {
     pub annual_reward_rate: f64,
     pub slashing_penalty: f64,
     pub double_sign_penalty: f64,
+    pub unbonding_epochs: u64,
 }
 impl Default for PoSConfig {
     fn default() -> Self {
@@ -22,6 +24,7 @@ impl Default for PoSConfig {
             annual_reward_rate: 0.05,
             slashing_penalty: 0.10,
             double_sign_penalty: 0.50,
+            unbonding_epochs: crate::account::UNBONDING_EPOCHS,
         }
     }
 }
@@ -67,12 +70,11 @@ use std::sync::RwLock;
 
 pub struct PoSEngine {
     pub config: PoSConfig,
-    
-    
     seen_blocks: RwLock<HashMap<(String, u64), (BlockHeader, Vec<u8>)>>,
     pub slashing_evidence: RwLock<Vec<SlashingEvidence>>,
     checkpoints: RwLock<Vec<Checkpoint>>,
     keypair: Option<KeyPair>,
+    epoch_seed: RwLock<[u8; 32]>,
 }
 impl PoSEngine {
     pub fn new(config: PoSConfig, keypair: Option<KeyPair>) -> Self {
@@ -82,9 +84,9 @@ impl PoSEngine {
             slashing_evidence: RwLock::new(Vec::new()),
             checkpoints: RwLock::new(Vec::new()),
             keypair,
+            epoch_seed: RwLock::new([0u8; 32]),
         }
     }
-    
 
     pub fn verify_evidence(&self, evidence: &SlashingEvidence) -> bool {
         if evidence.header1.index != evidence.header2.index {
@@ -148,7 +150,7 @@ impl PoSEngine {
     }
     pub fn select_validator(
         &self,
-        previous_hash: &str,
+        _previous_hash: &str,
         slot: u64,
         state: &AccountState,
     ) -> Option<Validator> {
@@ -156,15 +158,15 @@ impl PoSEngine {
         if total_stake == 0 {
             return None;
         }
+        let seed = self.epoch_seed.read().unwrap_or_else(|e| e.into_inner());
         let mut hasher = Sha3_256::new();
-        hasher.update(previous_hash.as_bytes());
+        hasher.update(*seed);
         hasher.update(slot.to_le_bytes());
         let hash = hasher.finalize();
         let random_value = u64::from_le_bytes(hash[0..8].try_into().unwrap_or([0; 8]));
         let selection_point = random_value % total_stake;
         let mut cumulative: u64 = 0;
         let active_validators = state.get_active_validators();
-
         for validator in active_validators {
             cumulative += validator.effective_stake();
             if selection_point < cumulative {
@@ -205,7 +207,7 @@ impl PoSEngine {
             .map_err(|e| format!("DB insert error: {}", e))?;
         db.flush().map_err(|e| format!("DB flush error: {}", e))?;
         println!(
-            "💾 PoS state saved: {} new checkpoints",
+            "PoS state saved: {} new checkpoints",
             self.checkpoints
                 .read()
                 .map_err(|_| "Lock error".to_string())?
@@ -217,7 +219,7 @@ impl PoSEngine {
         let data = match db.get("POS_STATE") {
             Ok(Some(d)) => d,
             Ok(None) => {
-                println!("📭 No saved PoS state found, starting fresh");
+                println!("No saved PoS state found, starting fresh");
                 return Ok(());
             }
             Err(e) => return Err(format!("DB read error: {}", e)),
@@ -247,7 +249,7 @@ impl PoSEngine {
         }
         
         println!(
-            "✅ PoS state loaded: {} checkpoints",
+            "PoS state loaded: {} checkpoints",
             self.checkpoints
                 .read()
                 .map_err(|_| "Lock error".to_string())?
@@ -267,7 +269,7 @@ impl ConsensusEngine for PoSEngine {
         if let Ok(mut evidences) = self.slashing_evidence.write() {
             if !evidences.is_empty() {
                 println!(
-                    "🔪 PoS: Including {} slashing evidences in block {}",
+                    "PoS: Including {} slashing evidences in block {}",
                     evidences.len(),
                     slot
                 );
@@ -286,13 +288,13 @@ impl ConsensusEngine for PoSEngine {
 
                         block.add_stake_proof(block.signature.clone().unwrap_or_default());
                         println!(
-                            "✍️  PoS: Block {} signed by selected validator {}",
+                            " PoS: Block {} signed by selected validator {}",
                             block.index,
                             &pubkey[..16.min(pubkey.len())]
                         );
                     }
                 } else {
-                    println!("⚠️  PoS: No keypair configured, cannot sign block");
+                    println!(" PoS: No keypair configured, cannot sign block");
                 }
 
                 if block.signature.is_none() {
@@ -385,12 +387,12 @@ impl ConsensusEngine for PoSEngine {
                     if let Some(producer) = &evidence.header1.producer {
                         if state.get_validator(producer).is_none() {
                             println!(
-                                "⚠️  Warning: Slashing evidence for unknown validator {}",
+                                " Warning: Slashing evidence for unknown validator {}",
                                 producer
                             );
                         } else {
                             println!(
-                                "⚖️  Valid Slashing Evidence found for validator {}",
+                                " Valid Slashing Evidence found for validator {}",
                                 producer
                             );
                         }
@@ -401,7 +403,7 @@ impl ConsensusEngine for PoSEngine {
             }
 
             println!(
-                "✅ PoS: Block {} validated (producer: {}, stake: {})",
+                "PoS: Block {} validated (producer: {}, stake: {})",
                 block.index,
                 &producer[..16.min(producer.len())],
                 expected.stake
@@ -434,7 +436,12 @@ impl ConsensusEngine for PoSEngine {
     }
 
     fn fork_choice_score(&self, chain: &[Block]) -> u128 {
-        chain.len() as u128
+        let last_checkpoint_height = if let Ok(guard) = self.checkpoints.read() {
+            guard.last().map(|c| c.block_index).unwrap_or(0)
+        } else {
+            0
+        };
+        (last_checkpoint_height as u128) * 1000 + chain.len() as u128
     }
 
     fn record_block(&self, block: &Block) -> Result<(), ConsensusError> {
@@ -446,6 +453,16 @@ impl ConsensusEngine for PoSEngine {
         let signature = block.signature.clone().unwrap_or_default();
         let key = (producer.clone(), header.index);
 
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_else(|_| block.hash.as_bytes().to_vec());
+        let mut block_contrib = Sha3_256::new();
+        block_contrib.update(&block_hash_bytes);
+        let contribution: [u8; 32] = block_contrib.finalize().into();
+        if let Ok(mut seed) = self.epoch_seed.write() {
+            for (i, byte) in seed.iter_mut().enumerate() {
+                *byte ^= contribution[i];
+            }
+        }
+
         let mut seen_blocks = self
             .seen_blocks
             .write()
@@ -453,12 +470,10 @@ impl ConsensusEngine for PoSEngine {
 
         if let Some(existing) = seen_blocks.get(&key) {
             if existing.0.hash != header.hash {
-                
                 println!(
-                    "🚨 DOUBLE-SIGN: {} signed two blocks for slot {}!",
+                    "DOUBLE-SIGN: {} signed two blocks for slot {}!",
                     producer, header.index
                 );
-
                 let evidence = SlashingEvidence::new(
                     existing.0.clone(),
                     header,
@@ -473,10 +488,10 @@ impl ConsensusEngine for PoSEngine {
             }
         } else {
             seen_blocks.insert(key, (header, signature));
-
-            
             if block.index > 0 && block.index % self.config.epoch_length == 0 {
-                
+                if let Ok(mut seed) = self.epoch_seed.write() {
+                    *seed = [0u8; 32];
+                }
                 let _ = self.add_checkpoint(block);
             }
         }

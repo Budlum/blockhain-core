@@ -1,6 +1,7 @@
 use super::{ConsensusEngine, ConsensusError};
 use crate::account::AccountState;
 use crate::Block;
+use std::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct PoWConfig {
     pub difficulty: usize,
@@ -20,6 +21,7 @@ impl Default for PoWConfig {
 }
 pub struct PoWEngine {
     pub config: PoWConfig,
+    current_difficulty: RwLock<usize>,
 }
 impl PoWEngine {
     pub fn new(difficulty: usize) -> Self {
@@ -28,13 +30,21 @@ impl PoWEngine {
                 difficulty,
                 ..Default::default()
             },
+            current_difficulty: RwLock::new(difficulty),
         }
     }
     pub fn with_config(config: PoWConfig) -> Self {
-        PoWEngine { config }
+        let d = config.difficulty;
+        PoWEngine {
+            config,
+            current_difficulty: RwLock::new(d),
+        }
+    }
+    pub fn get_difficulty(&self) -> usize {
+        *self.current_difficulty.read().unwrap_or_else(|e| e.into_inner())
     }
     fn target(&self) -> String {
-        "0".repeat(self.config.difficulty)
+        "0".repeat(self.get_difficulty())
     }
     fn meets_difficulty(&self, hash: &str) -> bool {
         hash.starts_with(&self.target())
@@ -43,8 +53,9 @@ impl PoWEngine {
         let target = self.target();
         let mut iterations: u64 = 0;
         println!(
-            "⛏️  Mining started (difficulty: {}, target: {}...)",
-            self.config.difficulty, target
+            " Mining started (difficulty: {}, target: {}...)",
+            self.get_difficulty(),
+            target
         );
         while !block.hash.starts_with(&target) {
             block.nonce += 1;
@@ -55,14 +66,13 @@ impl PoWEngine {
             }
         }
         println!(
-            "⛏️  Mining complete! {} iterations, nonce: {}",
+            " Mining complete! {} iterations, nonce: {}",
             iterations, block.nonce
         );
     }
-    #[allow(dead_code)]
     pub fn calculate_new_difficulty(&self, chain: &[Block]) -> usize {
         if chain.len() < self.config.adjustment_interval as usize {
-            return self.config.difficulty;
+            return self.get_difficulty();
         }
         let interval = self.config.adjustment_interval as usize;
         let last_block = &chain[chain.len() - 1];
@@ -70,7 +80,7 @@ impl PoWEngine {
         let actual_time = (last_block.timestamp - first_block.timestamp) / 1000;
         let expected_time = self.config.target_block_time * self.config.adjustment_interval;
         let ratio = expected_time as f64 / actual_time.max(1) as f64;
-        let new_diff = (self.config.difficulty as f64 * ratio) as usize;
+        let new_diff = (self.get_difficulty() as f64 * ratio) as usize;
         new_diff.clamp(1, 32)
     }
 }
@@ -111,10 +121,19 @@ impl ConsensusEngine for PoWEngine {
                 calculated_hash, block.hash
             )));
         }
+
+        if block.index > 0 && block.index % self.config.adjustment_interval == 0 {
+            let new_diff = self.calculate_new_difficulty(chain);
+            if let Ok(mut d) = self.current_difficulty.write() {
+                *d = new_diff;
+            }
+        }
+
         if !self.meets_difficulty(&block.hash) {
             return Err(ConsensusError(format!(
                 "Invalid PoW. {} leading zeros required, hash: {}",
-                self.config.difficulty, block.hash
+                self.get_difficulty(),
+                block.hash
             )));
         }
         Ok(())
@@ -125,14 +144,17 @@ impl ConsensusEngine for PoWEngine {
     fn info(&self) -> String {
         format!(
             "PoW (difficulty: {}, target: {}..., reward: {} coins)",
-            self.config.difficulty,
+            self.get_difficulty(),
             self.target(),
             self.config.block_reward
         )
     }
 
     fn fork_choice_score(&self, chain: &[Block]) -> u128 {
-        (chain.len() as u128) * (self.config.difficulty as u128)
+        chain.iter().fold(0u128, |acc, b| {
+            let leading = b.hash.chars().take_while(|c| *c == '0').count() as u128;
+            acc + leading.max(1)
+        })
     }
 }
 #[cfg(test)]

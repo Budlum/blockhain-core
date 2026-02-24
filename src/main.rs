@@ -32,7 +32,7 @@ async fn main() {
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    println!("🚀 Budlum Node - v0.2.0 (Framework Edition)");
+    println!("Budlum Node - v0.2.0 (Framework Edition)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("📋 Configuration:");
     println!("   Port: {}", config.port);
@@ -42,7 +42,7 @@ async fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     let consensus: Arc<dyn ConsensusEngine> = match config.consensus {
         ConsensusType::PoW => {
-            println!("⛏️  PoW mode - difficulty: {}", config.difficulty);
+            println!(" PoW mode - difficulty: {}", config.difficulty);
             Arc::new(PoWEngine::new(config.difficulty))
         }
         ConsensusType::PoS => {
@@ -61,7 +61,7 @@ async fn main() {
     let storage = match storage::Storage::new(&config.db_path) {
         Ok(s) => Some(s),
         Err(e) => {
-            println!("❌ Failed to initialize storage: {}", e);
+            println!("Failed to initialize storage: {}", e);
             None
         }
     };
@@ -86,14 +86,14 @@ async fn main() {
                  bc.state.validators.insert(addr, v);
              }
          } else {
-             println!("⚠️  No validators configured!");
+             println!(" No validators configured!");
          }
     }
 
     let mut node = Node::new(blockchain.clone()).unwrap();
     if let Some(ref addr) = config.bootstrap {
         if let Err(e) = node.bootstrap(addr) {
-            eprintln!("❌ Failed to bootstrap: {}", e);
+            eprintln!("Failed to bootstrap: {}", e);
         }
     }
     node.listen(config.port).unwrap();

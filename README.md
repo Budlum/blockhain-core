@@ -2,7 +2,7 @@
 
 **Budlum Core** is a production-grade, modular blockchain framework written in Rust. It serves as a high-performance Layer-1 blockchain featuring pluggable consensus engines (PoW, PoS, PoA), a hardened libp2p-based networking stack, and an atomic, account-based state model.
 
-The architecture emphasizes **security**, **modularity**, and **readability**, making it an ideal foundation for custom blockchain networks or educational study of advanced distributed ledger technology.
+The architecture emphasizes **security**, **modularity**, and **readability**, making it an ideal foundation for custom blockchain networks or educational study of advanced distributed ledger technology. With the latest Mainnet Hardening phases, the framework is incredibly robust against spam, DDOS, and chain manipulation.
 
 ---
 
@@ -10,12 +10,14 @@ The architecture emphasizes **security**, **modularity**, and **readability**, m
 
 - [Architecture Overview](#architecture-overview)
 - [Quick Start](#quick-start)
+- [Mainnet Hardening Features](#mainnet-hardening-features)
 - [Core Components Deep Dive](#core-components-deep-dive)
     - [1. Data Structures](#1-data-structures)
     - [2. Consensus Engines](#2-consensus-engines)
-    - [3. Networking Layer](#3-networking-layer)
-    - [4. State Management](#4-state-management)
-    - [5. Cryptography & Security](#5-cryptography--security)
+    - [3. Mempool & Anti-Spam](#3-mempool--anti-spam)
+    - [4. Networking Layer](#4-networking-layer)
+    - [5. State Management](#5-state-management)
+    - [6. Cryptography & Security](#6-cryptography--security)
 - [CLI Reference](#cli-reference)
 - [Development Guide](#development-guide)
 
@@ -47,7 +49,7 @@ graph TD
     subgraph "Networking Layer (libp2p)"
         Node --> Swarm[P2P Swarm]
         Swarm --> Gossip["GossipSub (Block/TX Propagation)"]
-        Swarm --> Disc["Discovery (Kademlia/mDNS)"]
+        Swarm --> Sync["Snap-Sync Engine"]
         Swarm --> PeerMgr[Peer Score & Ban Manager]
     end
 ```
@@ -95,15 +97,23 @@ cargo build --release
 ./target/release/budlum-core --consensus pos --min-stake 5000 --db-path ./data/pos_node
 ```
 
-**3. Proof of Authority (Permissioned)**
-Create `validators.json`:
-```json
-{ "validators": ["<validator_pubkey_hex_1>", "<validator_pubkey_hex_2>"] }
-```
-Run:
+**3. Join an Existing Network (Bootstrap)**
 ```bash
-./target/release/budlum-core --consensus poa --validators-file ./validators.json
+./target/release/budlum-core --bootstrap /ip4/127.0.0.1/tcp/4001/p2p/12D3K...
 ```
+
+---
+
+## 🛡️ Mainnet Hardening Features
+
+The Budlum blockchain has undergone massive security sweeping and optimization phases, making it ready for production environments.
+
+- **Token-Bucket Rate Limiting**: The Peer Manager assigns a burst capacity and message refill rate to every connected node, strictly dropping messages and punishing peers that attempt to flood or DDOS the network.
+- **Snap-Sync Acceleration**: Nodes syncing from behind request historical data using chunked bulk queries (`GetBlocksByHeight`).
+- **RANDAO-Style Leader Selection (PoS)**: Removed deterministic `previous_hash` dependencies across epochs. The generator now derives epoch freshness seeds using XOR collision (`Sha3(epoch_seed \|\| slot)`). It makes leader elections extremely resistant to single-block bias and network manipulation.
+- **Strict Network Isolation**: Nodes executing handshakes enforce `chain_id` checks immediately. Peers with mismatches are instantly banned from communicating to drop cross-chain pollution.
+- **Genesis Spoofing Ban**: Any transaction arriving into the mempool, or network block >0 proposing a transaction acting as `from: "genesis"`, is strictly rejected prior to propagation.
+- **Universal Transaction Validation**: Signatures are evaluated at every touchpoint before advancing into execution arrays.
 
 ---
 
@@ -128,7 +138,7 @@ A state-changing directive signed by a wallet.
 - **`from`/`to`**: Ed25519 Public Keys (Hex).
 - **`nonce`**: Sequence number. Must strictly increment (0, 1, 2...) for valid processing.
 - **`signature`**: Signs `hash(from, to, amount, fee, nonce, data, chain_id)`.
-- **Atomic Execution**: In Budlum, a block is atomic. If *any* transaction is invalid (bad signature, low balance), the *entire block* is rejected.
+- **Atomic Execution**: If any transaction fails cryptographic checks (or has invalid bounds for timestamp +15 seconds past server time), the execution fails.
 
 ---
 
@@ -136,20 +146,17 @@ A state-changing directive signed by a wallet.
 
 Budlum abstracts consensus into the `ConsensusEngine` trait.
 
+#### Proof of Stake (PoS) & RANDAO (`src/consensus/pos.rs`)
+- **Selection**: Implements a highly robust epoch-seed randomness engine. Transactions map their hashes via XOR logic at every iteration. It mitigates the bias "Nothing at Stake" vulnerabilities.
+- **Slashing**: Implements **Double-Sign Detection** using slashing evidence pools. Checks unbonding conditions with an active 7-epoch validator exit limit.
+
 #### Proof of Work (PoW) (`src/consensus/pow.rs`)
 - **Algorithm**: Standard SHA3-256 Hashcash.
-- **Logic**: `hash(block)` must start with `difficulty` number of zeros.
-- **Validation**: Verifiers verify `hash` meets target and structure is correct.
-
-#### Proof of Stake (PoS) (`src/consensus/pos.rs`)
-- **Selection**: Deterministic, stake-weighted random selection.
-- **Slashing**: Implements **Double-Sign Detection**. If a validator signs two blocks at the same height, their stake is burned.
-- **Evidence**: Blocks carry `SlashingEvidence` to enforce penalties.
+- **Validation**: Ensures blocks compute properly, and `cumulative difficulty` overrides trivial chain lengths for more sophisticated fork choices. Adaptive retargeting applies block delays.
 
 #### Proof of Authority (PoA) (`src/consensus/poa.rs`)
 - **Permissioned**: Only keys in `validators.json` can sign.
 - **Round-Robin**: Validators produce blocks in a strict rotation (`height % validator_count`).
-- **Suspension**: Authorities can be suspended for a period (`suspend_authority()`).
 
 ---
 
@@ -166,22 +173,11 @@ A structured transaction pool with advanced spam protection.
   - Duplicate rejection.
 - **TTL Expiration**: Stale transactions auto-removed.
 
-#### Configuration
-```rust
-MempoolConfig {
-    max_size: 5000,
-    max_per_sender: 16,
-    min_fee: 1,
-    tx_ttl_secs: 3600,
-    rbf_bump_percent: 10,
-}
-```
-
 ---
 
 ### 4. Genesis & Monetary Policy (`src/genesis.rs`)
 
-Deterministic genesis block and economic parameters.
+Deterministic genesis block (TIMESTAMP = 0) and economic parameters.
 
 #### GenesisConfig
 ```rust
@@ -197,64 +193,35 @@ GenesisConfig {
 #### Economic Constants
 - `BLOCK_REWARD`: 50 BDLM per block
 - `BASE_FEE`: 1 BDLM minimum transaction fee
-- `GENESIS_TIMESTAMP`: Fixed for deterministic hash
 
 ---
 
-### 5. Protocol Versioning (`src/encoding.rs`)
-
-Deterministic encoding and protocol compatibility.
-
-#### Version Info
-- **Protocol Version**: `1.0.0`
-- **Network Magic**: `0xBD4C4D01` ("BDLM" + version)
-
-#### Handshake Protocol
-New peer connections exchange version info:
-```rust
-NetworkMessage::Handshake {
-    version_major: 1,
-    version_minor: 0,
-    chain_id: 1337,
-    best_height: 12345,
-}
-```
-
-#### Deterministic Encoding
-- `encode_transaction()` - Binary tx encoding
-- `encode_block_header()` - Binary header encoding
-- Version compatibility checking
-
----
-
-### 6. Networking Layer
+### 4. Networking Layer
 
 Budlum uses the **libp2p** stack to ensure robust, decentralized peer-to-peer communication.
 
 #### Sync Protocol
 Headers-first synchronization for efficient chain sync:
-- `GetHeaders` / `Headers`: Lightweight header sync
-- `GetBlocksRange` / `Blocks`: Chunked block download
-- `NewTip`: Tip gossip for new block announcements
-- `GetStateSnapshot` / `SnapshotChunk`: State snapshot sync
+- `BlocksByHeight` (Snap-Sync): Rapid batch delivery mechanisms matching chain height.
+- `NewTip`: Tip gossip for new block announcements.
+- `GetStateSnapshot` / `SnapshotChunk`: State snapshot sync.
 
 #### Protocol Messages
 Defined in `src/network/protocol.rs`:
-- `Handshake` / `HandshakeAck`: Protocol version exchange.
+- `Handshake` / `HandshakeAck`: Protocol version exchange (Includes secure `chain_id` verifications).
 - `Block(Block)`: Broadcasts a new block to neighbors.
 - `Transaction(Transaction)`: Broadcasts a pending transaction.
-- `RequestChain` / `Chain(Vec<Block>)`: Full chain sync (legacy).
 
 #### DoS Protection: Peer Scoring
-To prevent spam and attacks, the `PeerManager` (`src/network/peer_manager.rs`) assigns scores:
+To prevent spam and attacks, the `PeerManager` (`src/network/peer_manager.rs`) assigns scores and Token-Bucket capacities:
 - **Valid Block**: +1
-- **Invalid Block**: -10
-- **Oversized Message**: -3
+- **Invalid Block**: -20
+- **Oversized Message / Spam**: Rate Limited Token Deductions / Bans
 - **Ban Threshold**: -100 (1 Hour Ban)
 
 ---
 
-### 4. State Management
+### 5. State Management
 
 Budlum uses an Account-based model (like Ethereum), not UTXO (like Bitcoin).
 
@@ -270,7 +237,7 @@ Data is persisted in **sled**, a high-performance embedded database.
 
 ---
 
-### 5. Cryptography & Security
+### 6. Cryptography & Security
 
 #### Standards
 - **Signatures**: **Ed25519** (Schnorr-based). Fast, secure, small keys.
@@ -311,7 +278,7 @@ Usage: `cargo run -- [OPTIONS]`
 ## 🛠️ Development Guide
 
 ### Running Tests
-Budlum has extensive unit and integration tests (83+ tests).
+Budlum has extensive unit and integration tests (77 tests).
 ```bash
 cargo test
 ```
@@ -319,7 +286,7 @@ cargo test
 **Key Test Suites:**
 - `integration_tests`: Simulates full node interactions.
 - `consensus::pos::tests`: Validates slashing and staking logic.
-- `network::peer_manager::tests`: Validates banning logic.
+- `network::peer_manager::tests`: Validates banning logic and token limits.
 
 ### Code Style
 - Format: `cargo fmt`

@@ -72,26 +72,26 @@ impl NodeConfig {
     pub fn load_validators(&self) -> Vec<String> {
         let path = Path::new(&self.validators_file);
         if !path.exists() {
-            println!("⚠️  Validators file not found: {}", self.validators_file);
+            println!(" Validators file not found: {}", self.validators_file);
             return vec![];
         }
         match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<ValidatorsConfig>(&content) {
                 Ok(config) => {
                     println!(
-                        "✅ Loaded {} validators from {}",
+                        "Loaded {} validators from {}",
                         config.validators.len(),
                         self.validators_file
                     );
                     config.validators
                 }
                 Err(e) => {
-                    println!("❌ Failed to parse validators file: {}", e);
+                    println!("Failed to parse validators file: {}", e);
                     vec![]
                 }
             },
             Err(e) => {
-                println!("❌ Failed to read validators file: {}", e);
+                println!("Failed to read validators file: {}", e);
                 vec![]
             }
         }

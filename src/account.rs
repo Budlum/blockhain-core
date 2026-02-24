@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub const MIN_TX_FEE: u64 = 1;
 pub const GENESIS_BALANCE: u64 = 1_000_000_000;
+pub const UNBONDING_EPOCHS: u64 = 7;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnbondingEntry {
+    pub address: String,
+    pub amount: u64,
+    pub release_epoch: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub public_key: String,
@@ -69,7 +77,8 @@ impl Validator {
 #[derive(Clone)]
 pub struct AccountState {
     pub accounts: HashMap<String, Account>,
-    pub validators: HashMap<String, Validator>, 
+    pub validators: HashMap<String, Validator>,
+    pub unbonding_queue: Vec<UnbondingEntry>,
     storage: Option<Storage>,
     pub epoch_index: u64,
     pub last_epoch_time: u64,
@@ -79,6 +88,7 @@ impl AccountState {
         AccountState {
             accounts: HashMap::new(),
             validators: HashMap::new(),
+            unbonding_queue: Vec::new(),
             storage: None,
             epoch_index: 0,
             last_epoch_time: 0,
@@ -88,6 +98,7 @@ impl AccountState {
         let mut state = AccountState {
             accounts: HashMap::new(),
             validators: HashMap::new(),
+            unbonding_queue: Vec::new(),
             storage: Some(storage),
             epoch_index: 0,
             last_epoch_time: 0,
@@ -221,21 +232,38 @@ impl AccountState {
                             .unwrap()
                             .as_secs();
                         validator.jail_until = now + jail_duration;
-                        println!("🔪 Slashed validator {} for {} stake", producer, penalty);
+                        println!("Slashed validator {} for {} stake", producer, penalty);
                     }
                 }
             }
         }
     }
 
+    pub fn process_unbonding(&mut self) {
+        let current_epoch = self.epoch_index;
+        let mut released: Vec<(String, u64)> = Vec::new();
+        self.unbonding_queue.retain(|entry| {
+            if entry.release_epoch <= current_epoch {
+                released.push((entry.address.clone(), entry.amount));
+                false
+            } else {
+                true
+            }
+        });
+        for (addr, amount) in released {
+            let account = self.get_or_create(&addr);
+            account.balance += amount;
+            println!("Unbonding released: {} received {} coins", &addr[..16.min(addr.len())], amount);
+        }
+    }
+
     pub fn advance_epoch(&mut self, current_timestamp: u128) {
         self.epoch_index += 1;
         self.last_epoch_time = current_timestamp as u64;
-        println!("🔄 Epoch advanced to {}", self.epoch_index);
+        println!("Epoch advanced to {}", self.epoch_index);
 
-        
-        
-        
+        self.process_unbonding();
+
         let current_time_sec = (current_timestamp / 1000) as u64;
 
         for (addr, validator) in self.validators.iter_mut() {
@@ -294,14 +322,6 @@ impl AccountState {
                 println!("Stake added: {} now has {}", tx.from, validator.stake);
             }
             TransactionType::Unstake => {
-                
-                
-                
-                
-                
-                
-
-                
                 let sender_start_balance = self.get_balance(&tx.from);
                 if sender_start_balance < tx.fee {
                     return Err("Insufficient balance for fee".into());
@@ -313,16 +333,22 @@ impl AccountState {
                     }
                     validator.stake -= tx.amount;
                     if validator.stake == 0 {
-                        validator.active = false; 
+                        validator.active = false;
                     }
-                    println!("Unstake: {} now has {}", tx.from, validator.stake);
+                    println!("Unstake queued: {} amount {} releases at epoch {}",
+                        tx.from, tx.amount, self.epoch_index + UNBONDING_EPOCHS);
                 } else {
                     return Err("Not a validator".into());
                 }
 
+                self.unbonding_queue.push(UnbondingEntry {
+                    address: tx.from.clone(),
+                    amount: tx.amount,
+                    release_epoch: self.epoch_index + UNBONDING_EPOCHS,
+                });
+
                 let sender = self.get_or_create(&tx.from);
-                sender.balance -= tx.fee; 
-                sender.balance += tx.amount; 
+                sender.balance -= tx.fee;
                 sender.nonce += 1;
             }
             TransactionType::Vote => {

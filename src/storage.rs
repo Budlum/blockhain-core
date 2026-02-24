@@ -14,6 +14,8 @@ impl Storage {
         let key = block.hash.clone();
         let val = serde_json::to_vec(block)?;
         self.db.insert(key, val)?;
+        let height_key = format!("HEIGHT:{}", block.index);
+        self.db.insert(height_key.as_bytes(), block.hash.as_bytes())?;
         self.db.flush()?;
         Ok(())
     }
@@ -25,12 +27,53 @@ impl Storage {
             Ok(None)
         }
     }
+    pub fn get_block_by_height(&self, height: u64) -> std::io::Result<Option<Block>> {
+        let height_key = format!("HEIGHT:{}", height);
+        if let Some(hash_bytes) = self.db.get(height_key.as_bytes())? {
+            let hash = from_utf8(&hash_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
+            self.get_block(&hash)
+        } else {
+            Ok(None)
+        }
+    }
+    pub fn get_canonical_height(&self) -> std::io::Result<u64> {
+        if let Some(val) = self.db.get("CANONICAL_HEIGHT")? {
+            let s = from_utf8(&val)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(s.parse().unwrap_or(0))
+        } else {
+            Ok(0)
+        }
+    }
+    pub fn save_canonical_height(&self, height: u64) -> std::io::Result<()> {
+        self.db.insert("CANONICAL_HEIGHT", height.to_string().as_bytes())?;
+        self.db.flush()?;
+        Ok(())
+    }
+    pub fn save_state_root(&self, height: u64, state_root: &str) -> std::io::Result<()> {
+        let key = format!("STATE_ROOT:{}", height);
+        self.db.insert(key.as_bytes(), state_root.as_bytes())?;
+        self.db.flush()?;
+        Ok(())
+    }
+    pub fn get_state_root(&self, height: u64) -> std::io::Result<Option<String>> {
+        let key = format!("STATE_ROOT:{}", height);
+        if let Some(val) = self.db.get(key.as_bytes())? {
+            let root = from_utf8(&val)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
+            Ok(Some(root))
+        } else {
+            Ok(None)
+        }
+    }
     pub fn save_last_hash(&self, hash: &str) -> std::io::Result<()> {
         self.db.insert("LAST", hash.as_bytes())?;
         self.db.flush()?;
         Ok(())
     }
-
     pub fn get_last_hash(&self) -> std::io::Result<Option<String>> {
         if let Some(val) = self.db.get("LAST")? {
             let hash = from_utf8(&val).unwrap().to_string();
@@ -39,7 +82,6 @@ impl Storage {
             Ok(None)
         }
     }
-
     pub fn load_chain(&self) -> std::io::Result<Vec<Block>> {
         let mut chain = Vec::new();
         if let Some(mut current_hash) = self.get_last_hash()? {

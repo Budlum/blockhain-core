@@ -16,7 +16,8 @@ impl fmt::Display for ConsensusError {
     }
 }
 impl Error for ConsensusError {}
-pub const MAX_FUTURE_BLOCK_TIME_MS: u128 = 15 * 60 * 1000;
+pub const MAX_FUTURE_BLOCK_TIME_MS: u128 = 15 * 1000;
+pub const MAX_PAST_BLOCK_TIME_MS: u128 = 2 * 60 * 60 * 1000;
 pub const MIN_BLOCK_INTERVAL_MS: u128 = 1000;
 pub const MAX_BLOCK_SIZE: usize = 1_000_000;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 5000;
@@ -45,13 +46,16 @@ pub trait ConsensusEngine: Send + Sync {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let max_allowed_time = now + MAX_FUTURE_BLOCK_TIME_MS;
-        if block.timestamp > max_allowed_time {
+        if block.timestamp > now + MAX_FUTURE_BLOCK_TIME_MS {
             return Err(ConsensusError(format!(
-                "Block timestamp too far in future. Max: {}, Got: {} (diff: {} ms)",
-                max_allowed_time,
-                block.timestamp,
+                "Block timestamp too far in future: {} ms ahead",
                 block.timestamp - now
+            )));
+        }
+        if block.timestamp + MAX_PAST_BLOCK_TIME_MS < now {
+            return Err(ConsensusError(format!(
+                "Block timestamp too old: {} ms behind",
+                now - block.timestamp
             )));
         }
         if let Some(prev) = prev_block {
@@ -107,7 +111,7 @@ pub trait ConsensusEngine: Send + Sync {
             let reorg_depth = current_chain.len() - ancestor.index as usize - 1;
             if reorg_depth > MAX_REORG_DEPTH {
                 println!(
-                    "⚠️  Rejecting deep reorg: {} blocks (max: {})",
+                    " Rejecting deep reorg: {} blocks (max: {})",
                     reorg_depth, MAX_REORG_DEPTH
                 );
                 return false;
@@ -144,7 +148,7 @@ mod tests {
     use super::*;
     #[test]
     fn test_constants() {
-        assert_eq!(MAX_FUTURE_BLOCK_TIME_MS, 900_000);
+        assert_eq!(MAX_FUTURE_BLOCK_TIME_MS, 15_000);
         assert_eq!(MIN_BLOCK_INTERVAL_MS, 1000);
         assert_eq!(MAX_REORG_DEPTH, 100);
     }

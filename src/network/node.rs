@@ -62,6 +62,7 @@ pub struct Node {
     pub peer_id: PeerId,
     pub blockchain: Arc<Mutex<Blockchain>>,
     pub peer_manager: Arc<Mutex<PeerManager>>,
+    pub bootstrap_peers: Vec<String>,
 }
 impl Node {
     pub fn new(blockchain: Arc<Mutex<Blockchain>>) -> Result<Self, Box<dyn Error>> {
@@ -125,7 +126,16 @@ impl Node {
             command_rx,
             blockchain,
             peer_manager,
+            bootstrap_peers: Vec::new(),
         })
+    }
+    pub fn new_with_bootstrap(
+        blockchain: Arc<Mutex<Blockchain>>,
+        bootstrap_peers: Vec<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut node = Self::new(blockchain)?;
+        node.bootstrap_peers = bootstrap_peers;
+        Ok(node)
     }
     pub fn get_client(&self) -> NodeClient {
         NodeClient {
@@ -163,7 +173,12 @@ impl Node {
         Ok(())
     }
     pub async fn run(&mut self) {
-        info!("🚀 Node running...");
+        info!("Node running...");
+        for addr in self.bootstrap_peers.clone() {
+            if let Err(e) = self.bootstrap(&addr) {
+                warn!("Bootstrap dial failed for {}: {}", addr, e);
+            }
+        }
         loop {
             tokio::select! {
                 cmd = self.command_rx.recv() => {
@@ -174,7 +189,7 @@ impl Node {
                                 if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
                                     warn!("Failed to subscribe: {}", e);
                                 } else {
-                                    info!("✅ Subscribed to topic: {}", topic);
+                                    info!("Subscribed to topic: {}", topic);
                                 }
                             }
                             NodeCommand::Broadcast(topic, msg) => {
@@ -202,7 +217,7 @@ impl Node {
                             info!("📍 Listening on {}", address);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            info!("🤝 Connected to {}", peer_id);
+                            info!("Connected to {}", peer_id);
                             let chain = self.blockchain.lock().unwrap();
                             info!("DEBUG: Connected to {}, Chain length: {}", peer_id, chain.chain.len());
                             if chain.chain.len() == 1 {
@@ -228,7 +243,7 @@ impl Node {
                             match event {
                                 mdns::Event::Discovered(peers) => {
                                     for (peer_id, addr) in peers {
-                                        info!("🔍 mDNS discovered: {} at {}", peer_id, addr);
+                                        info!("mDNS discovered: {} at {}", peer_id, addr);
                                         self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                         if let Err(e) = self.swarm.dial(addr.clone()) {
                                             warn!("Failed to dial discovered peer: {}", e);
@@ -250,29 +265,34 @@ impl Node {
                         })) => {
 
                             if self.peer_manager.lock().unwrap().is_banned(&peer_id) {
-                                warn!("⛔ Ignoring message from banned peer {}", peer_id);
+                                warn!("Ignoring message from banned peer {}", peer_id);
                                 continue;
                             }
 
-                            info!("📨 Received from {}: id={}", peer_id, id);
+                            if !self.peer_manager.lock().unwrap().check_rate_limit(&peer_id) {
+                                warn!("Rate limit exceeded for peer {}", peer_id);
+                                continue;
+                            }
+
+                            info!("Received from {}: id={}", peer_id, id);
                             match NetworkMessage::from_bytes_validated(&message.data) {
                                 Ok(msg) => match msg {
                                     NetworkMessage::Block(block) => {
                                         if let Err(e) = NetworkMessage::validate_block_size(&block) {
-                                            warn!("❌ Received oversized block from {}: {:?}", peer_id, e);
+                                            warn!("Received oversized block from {}: {:?}", peer_id, e);
                                             self.peer_manager.lock().unwrap().report_oversized_message(&peer_id);
                                             continue;
                                         }
-                                        info!("📦 BLOCK: #{} Hash: {}...", block.index, &block.hash[..8]);
+                                        info!("BLOCK: #{} Hash: {}...", block.index, &block.hash[..8]);
                                         let mut chain = self.blockchain.lock().unwrap();
                                         if block.index == chain.chain.len() as u64 {
                                             match chain.validate_and_add_block(block.clone()) {
                                                 Ok(_) => {
-                                                    info!("✅ Added block #{} to local chain", block.index);
+                                                    info!("Added block #{} to local chain", block.index);
                                                     self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
                                                 }
                                                 Err(e) => {
-                                                    warn!("❌ Block validation failed: {}", e);
+                                                    warn!("Block validation failed: {}", e);
                                                     self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
                                                 }
                                             }
@@ -280,11 +300,11 @@ impl Node {
                                     }
                                     NetworkMessage::Transaction(tx) => {
                                         if let Err(e) = NetworkMessage::validate_tx_size(&tx) {
-                                            warn!("❌ Received oversized transaction from {}: {:?}", peer_id, e);
+                                            warn!("Received oversized transaction from {}: {:?}", peer_id, e);
                                             self.peer_manager.lock().unwrap().report_oversized_message(&peer_id);
                                             continue;
                                         }
-                                        info!("💸 TX: {}->{} Amount: {}",
+                                        info!("TX: {}->{} Amount: {}",
                                             &tx.from[..8], &tx.to[..8], tx.amount);
                                         let mut chain = self.blockchain.lock().unwrap();
                                         match chain.add_transaction(tx) {
@@ -301,7 +321,7 @@ impl Node {
 
 
                                     NetworkMessage::GetHeaders { locator, limit } => {
-                                        info!("📥 GetHeaders request from {} (locator: {} hashes, limit: {})",
+                                        info!("GetHeaders request from {} (locator: {} hashes, limit: {})",
                                             peer_id, locator.len(), limit);
                                         let chain = self.blockchain.lock().unwrap();
 
@@ -319,7 +339,7 @@ impl Node {
                                             .map(|b| crate::BlockHeader::from_block(b))
                                             .collect();
 
-                                        info!("📤 Sending {} headers to {}", headers.len(), peer_id);
+                                        info!("Sending {} headers to {}", headers.len(), peer_id);
                                         let response = NetworkMessage::Headers(headers);
                                         let topic = gossipsub::IdentTopic::new("blocks");
                                         let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
@@ -327,17 +347,17 @@ impl Node {
 
                                     NetworkMessage::Headers(headers) => {
                                         if headers.len() > crate::network::protocol::MAX_HEADERS_PER_REQUEST as usize {
-                                            warn!("❌ Received too many headers ({}) from {}", headers.len(), peer_id);
+                                            warn!("Received too many headers ({}) from {}", headers.len(), peer_id);
                                             self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
                                             continue;
                                         }
-                                        info!("📨 Received {} headers from {}", headers.len(), peer_id);
+                                        info!("Received {} headers from {}", headers.len(), peer_id);
 
                                         self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
                                     }
 
                                     NetworkMessage::GetBlocksRange { from, to } => {
-                                        info!("📥 GetBlocksRange request from {} ({}..{})", peer_id, from, to);
+                                        info!("GetBlocksRange request from {} ({}..{})", peer_id, from, to);
                                         let chain = self.blockchain.lock().unwrap();
 
                                         let from_idx = from as usize;
@@ -347,7 +367,7 @@ impl Node {
 
                                         if from_idx < chain.chain.len() {
                                             let blocks: Vec<_> = chain.chain[from_idx..to_idx].to_vec();
-                                            info!("📤 Sending {} blocks to {}", blocks.len(), peer_id);
+                                            info!("Sending {} blocks to {}", blocks.len(), peer_id);
                                             let response = NetworkMessage::Blocks(blocks);
                                             let topic = gossipsub::IdentTopic::new("blocks");
                                             let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
@@ -356,17 +376,17 @@ impl Node {
 
                                     NetworkMessage::Blocks(blocks) => {
                                         if blocks.len() > crate::network::protocol::MAX_CHAIN_SYNC_BLOCKS {
-                                            warn!("❌ Received too many blocks ({}) from {}", blocks.len(), peer_id);
+                                            warn!("Received too many blocks ({}) from {}", blocks.len(), peer_id);
                                             self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
                                             continue;
                                         }
-                                        info!("📨 Received {} blocks from {}", blocks.len(), peer_id);
+                                        info!("Received {} blocks from {}", blocks.len(), peer_id);
                                         let mut chain = self.blockchain.lock().unwrap();
                                         for block in blocks {
                                             if block.index == chain.chain.len() as u64 {
                                                 match chain.validate_and_add_block(block.clone()) {
-                                                    Ok(_) => info!("✅ Added block #{}", block.index),
-                                                    Err(e) => warn!("❌ Block #{} failed: {}", block.index, e),
+                                                    Ok(_) => info!("Added block #{}", block.index),
+                                                    Err(e) => warn!("Block #{} failed: {}", block.index, e),
                                                 }
                                             }
                                         }
@@ -374,28 +394,103 @@ impl Node {
                                     }
 
                                     NetworkMessage::NewTip { height, hash } => {
-                                        info!("🔔 NewTip from {}: height={}, hash={}...", peer_id, height, &hash[..8.min(hash.len())]);
-                                        let chain = self.blockchain.lock().unwrap();
-                                        if height > chain.chain.len() as u64 {
-                                            info!("📡 Our chain is behind, requesting sync...");
-
+                                        info!("NewTip from {}: height={}, hash={}...", peer_id, height, &hash[..8.min(hash.len())]);
+                                        let our_height = self.blockchain.lock().unwrap().chain.len() as u64;
+                                        if height > our_height {
+                                            info!("Behind by {} blocks, snap-sync from {}", height - our_height, peer_id);
+                                            let req = NetworkMessage::GetBlocksByHeight {
+                                                from_height: our_height,
+                                                to_height: height,
+                                            };
+                                            let topic = gossipsub::IdentTopic::new("blocks");
+                                            let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, req.to_bytes());
                                         }
                                     }
 
                                     NetworkMessage::GetStateSnapshot { height } => {
-                                        info!("📥 GetStateSnapshot request from {} (height: {})", peer_id, height);
+                                        info!("GetStateSnapshot request from {} (height: {})", peer_id, height);
+                                        let chain = self.blockchain.lock().unwrap();
+                                        let (state_root, ok) = if let Some(ref store) = chain.storage {
+                                            match store.get_state_root(height) {
+                                                Ok(Some(root)) => (root, true),
+                                                _ => (String::new(), false),
+                                            }
+                                        } else {
+                                            (String::new(), false)
+                                        };
+                                        let response = NetworkMessage::StateSnapshotResponse { height, state_root, ok };
+                                        let topic = gossipsub::IdentTopic::new("blocks");
+                                        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
+                                    }
 
+                                    NetworkMessage::StateSnapshotResponse { height, state_root, ok } => {
+                                        if ok {
+                                            info!("StateSnapshot height={} root={}...", height, &state_root[..16.min(state_root.len())]);
+                                        } else {
+                                            warn!("StateSnapshot unavailable at height={}", height);
+                                        }
+                                    }
+
+                                    NetworkMessage::GetBlocksByHeight { from_height, to_height } => {
+                                        info!("GetBlocksByHeight [{}, {}] from {}", from_height, to_height, peer_id);
+                                        let chain = self.blockchain.lock().unwrap();
+                                        let cap = crate::network::protocol::MAX_SNAP_BATCH;
+                                        let to_height = to_height.min(from_height + cap);
+                                        let mut blocks = Vec::new();
+                                        if let Some(ref store) = chain.storage {
+                                            for h in from_height..=to_height {
+                                                match store.get_block_by_height(h) {
+                                                    Ok(Some(b)) => blocks.push(b),
+                                                    _ => break,
+                                                }
+                                            }
+                                        } else {
+                                            let from = from_height as usize;
+                                            let to = (to_height as usize + 1).min(chain.chain.len());
+                                            if from < chain.chain.len() {
+                                                blocks = chain.chain[from..to].to_vec();
+                                            }
+                                        }
+                                        info!("Sending {} blocks by height to {}", blocks.len(), peer_id);
+                                        let response = NetworkMessage::BlocksByHeight(blocks);
+                                        let topic = gossipsub::IdentTopic::new("blocks");
+                                        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, response.to_bytes());
+                                    }
+
+                                    NetworkMessage::BlocksByHeight(blocks) => {
+                                        if blocks.len() > crate::network::protocol::MAX_SNAP_BATCH as usize {
+                                            warn!("Too many snap-sync blocks from {}", peer_id);
+                                            self.peer_manager.lock().unwrap().report_invalid_block(&peer_id);
+                                            continue;
+                                        }
+                                        info!("Snap-sync: {} blocks from {}", blocks.len(), peer_id);
+                                        let mut chain = self.blockchain.lock().unwrap();
+                                        for block in blocks {
+                                            if block.index < chain.chain.len() as u64 {
+                                                continue;
+                                            }
+                                            match chain.validate_and_add_block(block.clone()) {
+                                                Ok(_) => info!("Snap-sync applied block #{}", block.index),
+                                                Err(e) => warn!("Snap-sync block #{} failed: {}", block.index, e),
+                                            }
+                                        }
+                                        self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
                                     }
 
                                     NetworkMessage::SnapshotChunk { height, index, total, data } => {
-                                        info!("📨 SnapshotChunk from {}: height={}, {}/{}, {} bytes",
+                                        info!("SnapshotChunk from {}: height={}, {}/{}, {} bytes",
                                             peer_id, height, index, total, data.len());
 
                                     }
 
-
                                     NetworkMessage::Handshake { version_major, version_minor, chain_id, best_height } => {
-                                        info!("🤝 Handshake from {}: v{}.{}, chain={}, height={}",
+                                        let my_chain_id = self.blockchain.lock().unwrap().chain_id;
+                                        if chain_id != my_chain_id {
+                                            warn!("Peer {} has wrong chain_id {} (expected {}). Banning.", peer_id, chain_id, my_chain_id);
+                                            self.peer_manager.lock().unwrap().ban_peer(&peer_id);
+                                            continue;
+                                        }
+                                        info!("Handshake from {}: v{}.{}, chain={}, height={}",
                                             peer_id, version_major, version_minor, chain_id, best_height);
 
                                         let chain = self.blockchain.lock().unwrap();
@@ -413,13 +508,19 @@ impl Node {
                                     }
 
                                     NetworkMessage::HandshakeAck { version_major, version_minor, chain_id, best_height } => {
-                                        info!("🤝 HandshakeAck from {}: v{}.{}, chain={}, height={}",
+                                        let my_chain_id = self.blockchain.lock().unwrap().chain_id;
+                                        if chain_id != my_chain_id {
+                                            warn!("Peer {} Ack with wrong chain_id {} (expected {}). Banning.", peer_id, chain_id, my_chain_id);
+                                            self.peer_manager.lock().unwrap().ban_peer(&peer_id);
+                                            continue;
+                                        }
+                                        info!("HandshakeAck from {}: v{}.{}, chain={}, height={}",
                                             peer_id, version_major, version_minor, chain_id, best_height);
                                         self.peer_manager.lock().unwrap().report_good_behavior(&peer_id);
                                     }
                                 },
                                 Err(e) => {
-                                    warn!("❌ Computed invalid message from {}: {:?}", peer_id, e);
+                                    warn!("Computed invalid message from {}: {:?}", peer_id, e);
 
                                     self.peer_manager.lock().unwrap().report_oversized_message(&peer_id);
                                 }
@@ -427,7 +528,7 @@ impl Node {
                         }
                         SwarmEvent::Behaviour(BudlumBehaviourEvent::Identify(event)) => {
                             if let identify::Event::Received { info, .. } = event {
-                                info!("🆔 Received identity from {:?}", info.public_key.to_peer_id());
+                                info!("Received identity from {:?}", info.public_key.to_peer_id());
                                 for addr in info.listen_addrs {
                                     self.swarm.behaviour_mut().kad.add_address(&info.public_key.to_peer_id(), addr);
                                 }
@@ -436,7 +537,7 @@ impl Node {
                         SwarmEvent::Behaviour(BudlumBehaviourEvent::Kad(event)) => {
                             match event {
                                 KademliaEvent::RoutingUpdated { peer, .. } => {
-                                    info!("🌐 Kademlia: Routing updated for peer {}", peer);
+                                    info!("Kademlia: Routing updated for peer {}", peer);
                                 }
                                 _ => {}
                             }

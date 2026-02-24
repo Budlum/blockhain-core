@@ -1,6 +1,6 @@
 # Bölüm 1.2: İşlemler ve Veri Transferi Mimarisi
 
-Bu bölüm, blok zincirindeki değer transferinin (Value Transfer) nasıl gerçekleştiğini, `Transaction` yapısının her bir parçasını neden koyduğumuzu ve güvenliği nasıl sağladığımızı anlatır.
+Bu bölüm, blok zincirindeki değer transferinin (Value Transfer) nasıl gerçekleştiğini, `Transaction` yapısının her bir parçasını neden koyduğumuzu ve `Mainnet Hardening` (Ana Ağ Güvenliği) paketleriyle gelen katı doğrulama kurallarını anlatır.
 
 Kaynak Dosya: `src/transaction.rs`
 
@@ -40,9 +40,9 @@ pub struct Transaction {
     pub fee: u64,           // İşlem Ücreti (Gas Fee)
     pub nonce: u64,         // Sıra Numarası (Anti-Replay)
     pub data: Vec<u8>,      // Ek Veri (Memo / Smart Contract Call)
-    pub timestamp: u128,    // Zaman
+    pub timestamp: u128,    // Zaman damgası (Daraltılmış güvenlik alanı)
     pub hash: String,       // İşlem ID (TxID)
-    pub signature: Option<Vec<u8>>, // Dijital İmza
+    pub signature: Option<Vec<u8>>, // Dijital İmza (Zorunlu)
     pub chain_id: u64,      // Ağ ID (Chain Isolation)
     pub tx_type: TransactionType, // Tip
 }
@@ -58,12 +58,25 @@ pub struct Transaction {
 | `fee` | `u64` | `u64` | **Rüşvet / Ücret.** Madencilerin/Validatörlerin bu işlemi bloğa koyması için ödenen teşviktir. Aynı zamanda Spam saldırılarını (milyonlarca bedava işlem) engeller. |
 | `nonce` | `u64` | Sıralı sayı. | **Anti-Replay Sayacı.** EN KRİTİK ALANLARDAN BİRİ. Alice Bob'a 10 coin yolladı. Bob bu işlemi ağa tekrar tekrar "replay" edip Alice'i soymasın diye var. Bir nonce sadece **BİR KERE** kullanılır. |
 | `data` | `Vec<u8>`| Byte dizisi. | **Memo / Veri.** "Kira ödemesi" gibi notlar veya ileride Smart Contract çağrıları için veri alanı. |
-| `signature`| `Option<Vec>` | Opsiyonel Byte dizisi. | **İmza.** "Bu işlemi gerçekten `from` adresinin sahibi mi yaptı?" sorusunun cevabı. Özel anahtar (Private Key) ile atılır. |
+| `timestamp`| `u128` | Epoch Zamanı. | **Zaman Penceresi.** İşlemin ne zaman üretildiği. Gelecekten (maksimum +15sn) veya çok geçmişten (maksimum -2 saat) gelen işlemler reddedilir. |
+| `signature`| `Option<Vec>` | Opsiyonel Byte dizisi. | **İmza.** "Bu işlemi gerçekten `from` adresinin sahibi mi yaptı?" sorusunun cevabı. Özel anahtar (Private Key) ile atılır. *Dipnot: İşlemler bir bloğa eklenmeden önce mutlakar doğrulanır.* |
 | `chain_id`| `u64` | Sabit Sayı. | **Zincir İzolasyonu.** Budlum Mainnet için üretilen bir imzalı işlemin, Budlum Testnet'te geçerli olmasını (veya tam tersi) engeller. |
 
 ---
 
 ## 2. Algoritmalar: Güvenlik Nasıl Sağlanır?
+
+### 2.1 Çekirdek Kriptografi: Katı İmza Doğrulaması
+
+İşlemler (Transaction), sisteme kabul edilmeden (Mempool'a girmeden VEYA başkasının yolladığı bir bloğun içindeyse bile) %100 oranında imza kontrolünden geçer. Bu bypass edilemez. `is_valid()` fonksiyonu tüm süreçlerin kilit taşıdır.
+
+### 2.2 Genesis Sahteciliği (Spoofing) Koruması
+
+**Kritik Güvenlik Kuralı:** Ağdaki herhangi bir peer (düğüm), "from" adresi "genesis" olan sahte bir işlem yaratıp cüzdanları sınırsız bakiyeyle şişirmeye çalışabilir (Genesis işlemleri imzasızdır). Bu duruma karşı **Mainnet Hardening** işlemi ile şu kurallar getirilmiştir:
+- İşlem Mempool'a eklenmek isteniyorsa `from == "genesis"` olanlar **ANINDA REDDEDİLİR**.
+- Ağdan p2p Blok geldiyse ve eğer bu blok 0. blok (sıfırıncı - gerçek Genesis) değilse, içindeki herhangi bir işlem "genesis" olduğunu iddia ediyorsa **BÜTÜN BLOK REDDEDİLİR**.
+
+---
 
 ### Fonksiyon: `signing_hash` (İmzalanacak Veri)
 
@@ -100,38 +113,6 @@ pub fn signing_hash(&self) -> [u8; 32] {
 
 ---
 
-### Fonksiyon: `check_validity` (Mantıksal Doğrulama)
-
-Kriptografik doğrulama (`verify`) yetmez, bir de iş mantığı (`business logic`) kontrolü gerekir.
-
-**Kodda `is_valid` Fonksiyonu:**
-
-```rust
-pub fn is_valid(&self) -> bool {
-    // 1. Önce imzayı kontrol et. İmza yoksa diğerlerine bakmaya gerek bile yok.
-    if !self.verify() { return false; }
-
-    // 2. İşlem tipine göre özel kontroller yap.
-    match self.tx_type {
-        TransactionType::Transfer => {
-            // Transferde alıcı adresi BOŞ OLAMAZ. Parayı uzaya gönderemeyiz.
-            if self.to.is_empty() { return false; }
-        }
-        TransactionType::Stake => {
-            // Stake miktarı 0 OLAMAZ. Sisteme yük bindirir.
-            if self.amount == 0 { return false; }
-        }
-        // ...
-    }
-    true
-}
-```
-
-**Neden Bunu Yazdık?**
-Ağı "çöp" veriden korumak için. İmzası geçerli olsa bile, alıcısı olmayan bir transfer işlemi veritabanında gereksiz yer kaplar. Bu fonksiyon, bu tür mantıksız işlemleri daha havuza (Mempool) girmeden reddetmemizi sağlar.
-
----
-
 ### Fonksiyon: `sign` (İmzalama Süreci)
 
 Bu fonksiyon client (cüzdan) tarafında çalışır.
@@ -155,4 +136,4 @@ pub fn sign(&mut self, keypair: &KeyPair) {
 }
 ```
 
-**Benzerlik:** Islak imza atmak gibidir. Önce metni yazarsınız (`signing_hash`), sonra altına imza atarsınız (`sign`). Metin değişirse imza geçersiz olur.
+**Benzerlik:** Islak imza atmak gibidir. Önce metni yazarsınız (`signing_hash`), sonra altına imza atarsınız (`sign`). Metin değişirse, bir bit dahi oynarsa imza anında matematiken geçersiz kalır.

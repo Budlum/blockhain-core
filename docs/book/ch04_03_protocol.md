@@ -9,50 +9,36 @@ Kaynak Dosya: `src/network/protocol.rs` (Varsayımsal)
 ## 1. Veri Yapıları: Ortak Dil
 
 Dünyanın her yerindeki bilgisayarların anlaşabilmesi için ortak bir `Enum` tanımlarız.
+# Protokol Mesajları ve Serileştirme (Serialization)
 
-### Enum: `NetworkMessage`
+`budlum-core` içindeki node'lar, eşler düzeyindeki (p2p) ağı yönetmek ve veri paylaşmak için özel `NetworkMessage` protokolünü kullanırlar.
 
-Düğümlerin birbirine söyleyebileceği her şey buradadır.
+## `NetworkMessage` Neler İçerir?
 
-```rust
-#[derive(Serialize, Deserialize)] // Serde kütüphanesi
-pub enum NetworkMessage {
-    // "Elimde yeni bir işlem var, ilgilenir misin?"
-    Transaction(Transaction),
+Ağdaki tüm iletişim bir enum (numaralandırılmış yapı) üzerinden geçer. En önemli türleri şunlardır:
 
-    // "Yeni bir blok buldum/onayladım!"
-    Block(Block),
+1.  **El Sıkışma (Handshake / HandshakeAck)**: Ağa yeni katılanlar bağlanırken versiyon ve `chain_id` bilgilerini doğrularlar. Hatalı `chain_id` anında engellenir (Ban).
+2.  **Block**: Yeni çıkarılan bir bloğun tüm peer'lara (eşlere) yayılması.
+3.  **Transaction**: Kullanıcılar tarafından oluşturulan ve doğrulanmış (imza, bakiye vb.) yeni bir işlemin mempool'lara (işlem havuzu) yayılması.
+4.  **NewTip**: Bir node, blok zincirinde yeni bir yüksekliğe ulaştığında, diğer düğümleri haberdar etmek için o bloğun hash ve yüksekliğini (height) gönderir.
+5.  **GetBlocksByHeight / BlocksByHeight (Snap-Sync)**: Zincirin gerisinde kalan bir düğümün, `NewTip` duyduğunda kendi yüksekliğinden itibaren yeni blokları 256'şar parçalar (chunk) halinde topluca istemesini (ve almasını) sağlayan hızlı senkronizasyon mesajlarıdır.
+6.  **GetStateSnapshot / StateSnapshotResponse**: Node'ların hızlı doğrulama için belli yüksekliklerdeki `state_root` özetini öğrenme taleplerini yönetir.
 
-    // "Sende Blok 100'den sonrası var mı?" (Senkronizasyon Başlangıcı)
-    GetBlocks { start_index: u64 },
+*Tam Liste kaynak kodu üzerinden incelenebilir: `src/network/protocol.rs`*
 
-    // "Evet var, işte Blok 100-150 arası listesi."
-    Blocks(Vec<Block>),
-    
-    // "Benim versiyonum v1.0, zincir ID'm 1337." (Handshake)
-    Hello { version: String, chain_id: u64 },
-}
-```
+## GossipSub ile Yayın Yapma (Publish)
 
-**Analiz:**
--   `Transaction` ve `Block` tipleri, Gossipsub (Radyo yayını) üzerinden HERKESE gönderilir.
--   `GetBlocks` ve `Blocks` tipleri, Request/Response (Soru-Cevap) mantığıyla DOĞRUDAN iki kişi arasında konuşulur.
+Budlum Core iletişimi **GossipSub** üzerinden yürütür. Doğrudan tek bir node'a mesaj göndermek yerine (TCP Direct Stream harici), belli konu başlıklarına (örneğin "blocks" veya "transactions") mesaj yayımlanır. Kütüphane optimalliği sayesinde bu mesaj saniyeler içinde ağdaki tüm düğümlere dedikodu ("gossip") yöntemiyle ulaşır.
 
----
+## Serileştirme (Serde)
 
-## 2. Serileştirme (Serialization)
-
-`Transaction` struct'ı RAM'de duran bir objedir. Kablodan (TCP) gönderilemez. Byte'lara çevrilmelidir.
-
-Budlum projesinde **`bincode`** formatı kullanılmıştır.
-
-### Neden `bincode`? (JSON değil de?)
-
--   **JSON:** `{"from": "Alice", "amount": 10}` (Okunabilir ama yer kaplar. String işleme yavaştır.)
+Mesajlar ağ üzerine bayt olarak çıkmadan önce serileştirilir.
+`budlum-core`, Rust ekosistemindeki en popüler formatlama kütüphanesi olan `serde` ve `serde_json` kullanır. İlerleyen güncellemelerde daha küçük bant genişliği kullanmak amacıyla `bincode` veya `protobuf`'a geçiş hedeflenmektedir. O anki (Handshake ve Sync paketi harici) standart payload boyutu metin tabanlı JSON ile yönetilmektedir.
+ce", "amount": 10}` (Okunabilir ama yer kaplar. String işleme yavaştır.)
 -   **Bincode:** `05416c6963650a000000...` (Binary. Çok sıkışıktır. CPU dostudur.)
 
 **Performans Farkı:**
-Blok zincirinde saniyede binlerce işlem olur. JSON kullanmak, ağı %30-40 yavaşlatır ve CPU'yu yorar. Bincode, Rust struct'larını doğrudan bellekteki haliyle (veya ona çok yakın) diske/ağa yazar.
+Blok zincirinde saniyede binlerce işlem olur. JSON kullanmak, ağı %30-40 yavaşlatır ve CPU'yu yorar. Bincode, Rust struct'larını doğrudan bellekteki haliyle (ve ona çok yakın) diske/ağa yazar.
 
 ---
 

@@ -61,12 +61,12 @@ impl Blockchain {
                     }
                     snapshot_height = snapshot.height;
                     println!(
-                        "✅ Restored state from snapshot at height {}",
+                        "Restored state from snapshot at height {}",
                         snapshot_height
                     );
                 } else {
                     println!(
-                        "⚠️  Snapshot chain_id mismatch (expected {}, got {}). Ignoring.",
+                        " Snapshot chain_id mismatch (expected {}, got {}). Ignoring.",
                         chain_id, snapshot.chain_id
                     );
                 }
@@ -78,7 +78,7 @@ impl Blockchain {
             (snapshot_height + 1) as usize
         } else {
             if snapshot_height >= chain_len as u64 {
-                println!("⚠️  Chain shorter than snapshot height! Replaying from Genesis.");
+                println!(" Chain shorter than snapshot height! Replaying from Genesis.");
                 0
             } else {
                 0
@@ -86,27 +86,13 @@ impl Blockchain {
         };
 
         println!(
-            "🔄 Replaying blocks from index {} to {}...",
+            "Replaying blocks from index {} to {}...",
             start_index,
             chain_len - 1
         );
 
-        for (i, block) in chain_vec.iter().enumerate().skip(start_index) {
-            if i == 0 {}
-
-            for tx in &block.transactions {
-                if let Err(e) = state.apply_transaction(tx) {
-                    println!("❌ Error applying block {} tx: {}", block.index, e);
-                }
-            }
-
-            let total_fees: u64 = block.transactions.iter().map(|t| t.fee).sum();
-            if let Some(ref producer) = block.producer {
-                if total_fees > 0 {
-                    let acc = state.get_or_create(producer);
-                    acc.balance += total_fees;
-                }
-            }
+        for block in chain_vec.iter().skip(start_index) {
+            state.apply_block(&block.transactions, block.producer.as_deref());
         }
 
         Blockchain {
@@ -182,6 +168,10 @@ impl Blockchain {
 
         block.producer = Some(producer_address.clone());
 
+        let mut state_for_root = self.state.clone();
+        state_for_root.apply_block(&block.transactions, block.producer.as_deref());
+        block.state_root = state_for_root.calculate_state_root();
+
         if let Err(e) = self.consensus.prepare_block(&mut block, &self.state) {
             println!("Block preparation failed: {}", e);
             return;
@@ -191,11 +181,11 @@ impl Blockchain {
         if let Some(ref store) = self.storage {
             let _ = store.insert_block(&block);
             let _ = store.save_last_hash(&block.hash);
+            let _ = store.save_state_root(block.index, &block.state_root);
+            let _ = store.save_canonical_height(block.index);
         }
 
-        for tx in &block.transactions {
-            let _ = self.state.apply_transaction(tx);
-        }
+        self.state.apply_block(&block.transactions, block.producer.as_deref());
 
         if block.index > 0 && block.index % EPOCH_LENGTH == 0 {
             self.state.advance_epoch(block.timestamp);
@@ -216,6 +206,12 @@ impl Blockchain {
                 "Invalid Chain ID: expected {}, got {}",
                 self.chain_id, transaction.chain_id
             ));
+        }
+        if transaction.from == "genesis" {
+            return Err("Genesis transactions cannot be submitted to the mempool".into());
+        }
+        if !transaction.verify() {
+            return Err("Invalid transaction signature".into());
         }
         if let Err(e) = self.state.validate_transaction(&transaction) {
             return Err(format!("Invalid transaction: {}", e));
@@ -238,22 +234,55 @@ impl Blockchain {
             ));
         }
 
+        let expected_tx_root = block.calculate_tx_root();
+        if block.tx_root != expected_tx_root {
+            return Err(format!(
+                "tx_root mismatch: expected {}, got {}",
+                expected_tx_root, block.tx_root
+            ));
+        }
+
+        let expected_hash = block.calculate_hash();
+        if block.hash != expected_hash {
+            return Err(format!(
+                "block hash mismatch: expected {}, got {}",
+                expected_hash, block.hash
+            ));
+        }
+
+        if block.index > 0 && block.state_root.is_empty() {
+            return Err("Block missing state_root".into());
+        }
+
         if let Err(e) = self
             .consensus
-            .validate_block(&block, &self.chain, &self.state)
+            .full_validate(&block, &self.chain, &self.state)
         {
             return Err(format!("Consensus validation failed: {}", e));
         }
 
         let mut temp_state = self.state.clone();
         for (i, tx) in block.transactions.iter().enumerate() {
+            if block.index > 0 && tx.from == "genesis" {
+                return Err(format!(
+                    "Invalid transaction at index {}: 'genesis' transactions only allowed in genesis block", i
+                ));
+            }
+            if block.index > 0 {
+                if let Err(e) = temp_state.validate_transaction(tx) {
+                    return Err(format!("Invalid transaction at index {}: {}", i, e));
+                }
+            }
             if let Err(e) = temp_state.apply_transaction(tx) {
-                return Err(format!("Invalid transaction at index {}: {}", i, e));
+                return Err(format!("Failed to apply transaction at index {}: {}", i, e));
             }
         }
 
-        if !block.state_root.is_empty() {
-            let computed_root = temp_state.calculate_state_root();
+        let mut commit_state = self.state.clone();
+        commit_state.apply_block(&block.transactions, block.producer.as_deref());
+
+        if block.index > 0 {
+            let computed_root = commit_state.calculate_state_root();
             if computed_root != block.state_root {
                 return Err(format!(
                     "State root mismatch: expected {}, got {}",
@@ -265,18 +294,20 @@ impl Blockchain {
         if let Some(ref store) = self.storage {
             let _ = store.insert_block(&block);
             let _ = store.save_last_hash(&block.hash);
+            let _ = store.save_state_root(block.index, &block.state_root);
+            let _ = store.save_canonical_height(block.index);
         }
 
         if let Some(evidences) = &block.slashing_evidence {
             let slash_ratio = 0.1;
-            temp_state.apply_slashing(evidences, slash_ratio);
+            commit_state.apply_slashing(evidences, slash_ratio);
         }
 
         if block.index > 0 && block.index % EPOCH_LENGTH == 0 {
-            temp_state.advance_epoch(block.timestamp);
+            commit_state.advance_epoch(block.timestamp);
         }
 
-        self.state = temp_state;
+        self.state = commit_state;
 
         self.chain.push(block);
 
@@ -414,32 +445,8 @@ impl Blockchain {
 
     fn rebuild_state(chain: &[Block]) -> Result<AccountState, String> {
         let mut state = AccountState::new();
-
         for block in chain.iter() {
-            for (tx_idx, tx) in block.transactions.iter().enumerate() {
-                if tx.from == "genesis" {
-                    continue;
-                }
-                if let Err(e) = state.apply_transaction(tx) {
-                    return Err(format!(
-                        "State replay failed at block {} tx {}: {}",
-                        block.index, tx_idx, e
-                    ));
-                }
-            }
-
-            let mut total_fees: u64 = 0;
-            for tx in &block.transactions {
-                if tx.from != "genesis" {
-                    total_fees += tx.fee;
-                }
-            }
-            if let Some(producer) = &block.producer {
-                if total_fees > 0 {
-                    let producer_account = state.get_or_create(producer);
-                    producer_account.balance += total_fees;
-                }
-            }
+            state.apply_block(&block.transactions, block.producer.as_deref());
         }
         Ok(state)
     }
@@ -602,22 +609,10 @@ mod tests {
 
         
         
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-
-        
-        
 
         let mut blockchain2 = Blockchain::new(engine.clone(), None, 1337, None);
         blockchain2.state.add_validator(alice_pub.clone(), 2000);
+        blockchain2.state.add_balance(&alice_pub, 100);
         blockchain2
             .validate_and_add_block(produced_block.clone())
             .unwrap();
@@ -626,5 +621,74 @@ mod tests {
         assert!(validator.slashed, "Validator should be slashed");
         assert!(!validator.active);
         assert!(validator.stake < 2000);
+    }
+
+    #[test]
+    fn test_fee_reaches_producer() {
+        let consensus = Arc::new(PoWEngine::new(0));
+        let sender = KeyPair::generate().unwrap();
+        let sender_pub = sender.public_key_hex();
+        let mut bc = Blockchain::new(consensus, None, 1337, None);
+        bc.state.add_balance(&sender_pub, 1000);
+
+        let mut tx = Transaction::new_with_fee(
+            sender_pub.clone(),
+            "bob".into(),
+            100,
+            5,
+            0,
+            vec![],
+        );
+        tx.sign(&sender);
+        bc.add_transaction(tx).unwrap();
+
+        bc.produce_block("miner_addr".to_string());
+        assert_eq!(bc.state.get_balance("miner_addr"), 5);
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_state_root() {
+        let consensus = Arc::new(PoWEngine::new(0));
+        let mut bc = Blockchain::new(consensus, None, 1337, None);
+
+        let mut block = Block::new(1, bc.last_block().hash.clone(), vec![]);
+        block.chain_id = 1337;
+        block.state_root = String::new();
+        block.hash = block.calculate_hash();
+
+        let result = bc.validate_and_add_block(block);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("state_root"));
+    }
+
+    #[test]
+    fn test_validate_rejects_tampered_tx_root() {
+        let consensus = Arc::new(PoWEngine::new(0));
+        let mut bc = Blockchain::new(consensus, None, 1337, None);
+
+        let mut block = Block::new(1, bc.last_block().hash.clone(), vec![]);
+        block.chain_id = 1337;
+        block.state_root = "a".repeat(64);
+        block.tx_root = "b".repeat(64);
+        block.hash = block.calculate_hash();
+
+        let result = bc.validate_and_add_block(block);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("tx_root"));
+    }
+
+    #[test]
+    fn test_validate_rejects_tampered_hash() {
+        let consensus = Arc::new(PoWEngine::new(0));
+        let mut bc = Blockchain::new(consensus, None, 1337, None);
+
+        let mut block = Block::new(1, bc.last_block().hash.clone(), vec![]);
+        block.chain_id = 1337;
+        block.state_root = "a".repeat(64);
+        block.hash = "c".repeat(64);
+
+        let result = bc.validate_and_add_block(block);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hash"));
     }
 }

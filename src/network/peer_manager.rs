@@ -9,6 +9,8 @@ pub const BAN_THRESHOLD: i32 = -100;
 pub const BAN_DURATION: Duration = Duration::from_secs(3600);
 pub const MAX_SCORE: i32 = 100;
 pub const MIN_SCORE: i32 = -99;
+pub const MAX_MSG_BURST: f64 = 20.0;
+pub const MSG_REFILL_RATE: f64 = 5.0;
 #[derive(Debug, Clone)]
 pub struct PeerScore {
     pub score: i32,
@@ -17,6 +19,8 @@ pub struct PeerScore {
     pub invalid_txs: u32,
     pub valid_contributions: u32,
     pub last_seen: Option<Instant>,
+    pub rate_tokens: f64,
+    pub rate_last_refill: Instant,
 }
 impl Default for PeerScore {
     fn default() -> Self {
@@ -27,6 +31,8 @@ impl Default for PeerScore {
             invalid_txs: 0,
             valid_contributions: 0,
             last_seen: None,
+            rate_tokens: MAX_MSG_BURST,
+            rate_last_refill: Instant::now(),
         }
     }
 }
@@ -37,6 +43,21 @@ impl PeerScore {
     pub fn is_banned(&self) -> bool {
         if let Some(until) = self.banned_until {
             Instant::now() < until
+        } else {
+            false
+        }
+    }
+    pub fn refill_tokens(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.rate_last_refill).as_secs_f64();
+        self.rate_tokens = (self.rate_tokens + elapsed * MSG_REFILL_RATE).min(MAX_MSG_BURST);
+        self.rate_last_refill = now;
+    }
+    pub fn consume_token(&mut self) -> bool {
+        self.refill_tokens();
+        if self.rate_tokens >= 1.0 {
+            self.rate_tokens -= 1.0;
+            true
         } else {
             false
         }
@@ -63,6 +84,18 @@ impl PeerManager {
     }
     fn get_or_create(&mut self, peer_id: &PeerId) -> &mut PeerScore {
         self.peers.entry(*peer_id).or_insert_with(PeerScore::new)
+    }
+    pub fn check_rate_limit(&mut self, peer_id: &PeerId) -> bool {
+        let score = self.get_or_create(peer_id);
+        if !score.consume_token() {
+            score.score = (score.score + OVERSIZED_MESSAGE_PENALTY).max(MIN_SCORE);
+            if score.score <= BAN_THRESHOLD {
+                let until = Instant::now() + BAN_DURATION;
+                score.banned_until = Some(until);
+            }
+            return false;
+        }
+        true
     }
     pub fn report_invalid_block(&mut self, peer_id: &PeerId) {
         let score = self.get_or_create(peer_id);

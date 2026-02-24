@@ -1,3 +1,7 @@
 /target
 /data
 *.log
+
+# QMD storage
+qmd/
+scripts/
