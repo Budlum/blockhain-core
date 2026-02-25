@@ -29,29 +29,29 @@ Budlum Core follows a layered architecture where modules are loosely coupled thr
 
 ```mermaid
 graph TD
-    User((User)) --> CLI[CLI / API Layer]
-    CLI --> Node[Node Service]
+    User(("User")) --> CLI["CLI / API Layer"]
+    CLI --> Node["Node Service"]
     
     subgraph "Core Blockchain Logic"
-        Node --> Chain[Blockchain Manager]
+        Node --> Chain["Blockchain Manager"]
         Chain --> State["Account State (Balances/Nonces)"]
-        Chain --> Mempool[Pending Transactions]
+        Chain --> Mempool["Pending Transactions"]
         Chain --> Store["Storage (Sled DB)"]
     end
 
     subgraph "Consensus Layer (Hybrid)"
-        Chain -.-> Engine[ConsensusEngine Trait]
-        Engine --> PoW[Proof of Work]
-        Engine --> PoS[Proof of Stake + VRF]
-        Engine --> Finality[BLS Finality Layer]
-        Engine --> QC[Optimistic QC - PQ Attestation]
+        Chain -.-> Engine["ConsensusEngine Trait"]
+        Engine --> PoW["Proof of Work"]
+        Engine --> PoS["Proof of Stake + VRF"]
+        Engine --> Finality["BLS Finality Layer"]
+        Engine --> QC["Optimistic QC - PQ Attestation"]
     end
 
     subgraph "Networking Layer (libp2p)"
-        Node --> Swarm[P2P Swarm]
+        Node --> Swarm["P2P Swarm"]
         Swarm --> Gossip["GossipSub (Block/TX Propagation)"]
         Swarm --> Sync["Snap-Sync Engine"]
-        Swarm --> PeerMgr[Granular Rate Limiting]
+        Swarm --> PeerMgr["Granular Rate Limiting"]
     end
 ```
 
